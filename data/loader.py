@@ -225,6 +225,25 @@ def _read_gsheet() -> pd.DataFrame:
 # TW 價格（SQLite）
 # ════════════════════════════════════════════════════════
 
+def _get_s3_client():
+    """建立 S3 client（優先使用 config 裡的金鑰，其次 IAM Role）"""
+    kwargs = {"region_name": config.AWS_REGION}
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"]     = config.AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = config.AWS_SECRET_ACCESS_KEY
+    return boto3.client("s3", **kwargs)
+
+
+def _get_s3fs():
+    """建立 s3fs FileSystem（供 pyarrow dataset 使用）"""
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        return s3fs.S3FileSystem(
+            key=config.AWS_ACCESS_KEY_ID,
+            secret=config.AWS_SECRET_ACCESS_KEY,
+        )
+    return s3fs.S3FileSystem()   # 使用 IAM Role / 本機 ~/.aws
+
+
 def _ensure_tw_db() -> None:
     """確保本地 SQLite 快取是今天的版本，否則重新下載"""
     today_str = date.today().isoformat()
@@ -235,7 +254,7 @@ def _ensure_tw_db() -> None:
             return   # 已是今日版本，不重新下載
 
     logger.info("下載 tw_market.db（約 370MB，首次或每日一次）...")
-    s3 = boto3.client("s3", region_name=config.AWS_REGION)
+    s3 = _get_s3_client()
     s3.download_file(BUCKET, TW_DB_S3_KEY, str(TW_DB_LOCAL))
     TW_DB_DATE_FILE.write_text(today_str)
     logger.info("tw_market.db 下載完成")
@@ -302,7 +321,7 @@ def _get_tw_sector(symbol: str) -> str:
 def _read_us_prices(symbol: str, days: int) -> pd.DataFrame | None:
     """從 S3 Hive Parquet 讀取美股歷史價格，只取指定 symbol 的資料列"""
     try:
-        fs = s3fs.S3FileSystem()
+        fs = _get_s3fs()
         dataset = ds.dataset(
             f"{BUCKET}/data_lake/price/market=US/",
             filesystem=fs,

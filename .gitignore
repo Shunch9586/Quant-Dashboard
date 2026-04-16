@@ -20,7 +20,8 @@ __pycache__/
 data/raw/
 data/cache/
 
-# Streamlit 快取
+# Streamlit（secrets 絕對不能上傳）
+.streamlit/secrets.toml
 .streamlit/cache/
 
 # IDE
