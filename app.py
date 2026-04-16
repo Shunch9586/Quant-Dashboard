@@ -51,7 +51,7 @@ def load_data():
 
 records, summary = load_data()
 
-# ── 右上角：資料來源標記 + 最後更新時間 ──────────────────
+# ── 右上角：資料來源標記 + 刷新按鈕 ──────────────────────
 header_col, info_col = st.columns([4, 1])
 with header_col:
     st.title("📈 Quant Dashboard")
@@ -59,8 +59,11 @@ with info_col:
     mode_badge = "🧪 Mock Data" if config.USE_MOCK_DATA else "✅ Live S3"
     st.markdown(f"<div style='text-align:right; padding-top:12px;'>"
                 f"<span style='background:#333; padding:4px 10px; border-radius:12px; font-size:0.8em;'>{mode_badge}</span><br>"
-                f"<span style='color:#888; font-size:0.75em;'>📅 {date.today()}</span>"
+                f"<span style='color:#888; font-size:0.75em;'>📅 {date.today()} · {len(records)} 筆持倉</span>"
                 f"</div>", unsafe_allow_html=True)
+    if st.button("🔄 重新載入", use_container_width=True):
+        load_data.clear()
+        st.rerun()
 
 st.divider()
 

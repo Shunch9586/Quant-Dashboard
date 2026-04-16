@@ -56,8 +56,8 @@ class DecisionRecord:
 
     @property
     def at_stop_risk(self) -> bool:
-        """距離 stop price 5% 以內視為高風險"""
-        return self.distance_to_stop < 0.05
+        """距離 stop price 5% 以內視為高風險（未設止損的持倉不計入）"""
+        return self.stop_price > 0 and 0 <= self.distance_to_stop < 0.05
 
 
 @dataclass
