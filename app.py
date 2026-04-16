@@ -14,6 +14,7 @@ from datetime import date
 import config
 from data.loader import load_positions, load_portfolio_summary
 from views import portfolio_summary, alert_queue, position_detail, technical_health, history_view
+from views import market_scan
 
 # ── 頁面基礎設定 ──────────────────────────────────────────
 st.set_page_config(
@@ -68,41 +69,44 @@ with info_col:
 st.divider()
 
 # ════════════════════════════════════════════════════════
-# ZONE A — Portfolio Summary（全寬）
+# Tab 切換：持倉總覽 / 市場掃描
 # ════════════════════════════════════════════════════════
-portfolio_summary.render(summary)
+tab_portfolio, tab_scan = st.tabs(["📊 持倉總覽", "🔍 市場掃描"])
 
-st.divider()
+with tab_portfolio:
+    # ── ZONE A — Portfolio Summary（全寬）────────────────
+    portfolio_summary.render(summary)
 
-# ════════════════════════════════════════════════════════
-# ZONE B + C — Alert Queue（左）＋ Position Detail（右）
-# ════════════════════════════════════════════════════════
-zone_b, zone_c = st.columns([4, 6], gap="large")
+    st.divider()
 
-with zone_b:
-    clicked_from_alert = alert_queue.render(records)
-    if clicked_from_alert:
-        st.session_state.selected_symbol = clicked_from_alert
+    # ── ZONE B + C — Alert Queue（左）＋ Position Detail（右）
+    zone_b, zone_c = st.columns([4, 6], gap="large")
 
-with zone_c:
-    selected = st.session_state.selected_symbol
-    record   = next((r for r in records if r.symbol == selected), None)
-    position_detail.render(record)
+    with zone_b:
+        clicked_from_alert = alert_queue.render(records)
+        if clicked_from_alert:
+            st.session_state.selected_symbol = clicked_from_alert
 
-st.divider()
+    with zone_c:
+        selected = st.session_state.selected_symbol
+        record   = next((r for r in records if r.symbol == selected), None)
+        position_detail.render(record)
 
-# ════════════════════════════════════════════════════════
-# ZONE D + E — Technical Health（左）＋ History（右）
-# ════════════════════════════════════════════════════════
-zone_d, zone_e = st.columns([4, 6], gap="large")
+    st.divider()
 
-with zone_d:
-    clicked_from_health = technical_health.render(records)
-    if clicked_from_health:
-        st.session_state.selected_symbol = clicked_from_health
+    # ── ZONE D + E — Technical Health（左）＋ History（右）
+    zone_d, zone_e = st.columns([4, 6], gap="large")
 
-with zone_e:
-    history_view.render(st.session_state.selected_symbol)
+    with zone_d:
+        clicked_from_health = technical_health.render(records)
+        if clicked_from_health:
+            st.session_state.selected_symbol = clicked_from_health
+
+    with zone_e:
+        history_view.render(st.session_state.selected_symbol)
+
+with tab_scan:
+    market_scan.render()
 
 # ── Footer ────────────────────────────────────────────────
 st.divider()
