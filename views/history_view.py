@@ -11,6 +11,21 @@ from data.models import HistoryPoint
 from data.loader import load_history
 
 
+def _chart_config() -> dict:
+    """Plotly 圖表互動設定：滑鼠滾輪縮放 + 雙擊/Reset 按鈕還原 + 最小 Modebar"""
+    return {
+        "displayModeBar": "hover",          # hover 才顯示，不佔位
+        "displaylogo": False,
+        "scrollZoom": True,                 # 滑鼠滾輪縮放
+        "doubleClick": "reset+autosize",    # 雙擊重置所有縮放
+        "modeBarButtonsToRemove": [
+            "pan2d", "select2d", "lasso2d", "autoScale2d",
+            "hoverClosestCartesian", "hoverCompareCartesian",
+            "toggleSpikelines",
+        ],
+    }
+
+
 def render(symbol: str | None) -> None:
     st.markdown("### 📜 History")
 
@@ -102,7 +117,7 @@ def _render_dual_axis_chart(symbol: str, history: list[HistoryPoint]) -> None:
     fig.update_yaxes(title_text="Score",   secondary_y=True,  range=[0, 100], showgrid=False)
     fig.update_xaxes(gridcolor="#222")
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, config=_chart_config())
 
 
 def _render_score_delta_bar(history: list[HistoryPoint]) -> None:
@@ -129,4 +144,4 @@ def _render_score_delta_bar(history: list[HistoryPoint]) -> None:
         yaxis=dict(gridcolor="#222", title="Δ Score"),
         xaxis=dict(gridcolor="#222"),
     )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, config=_chart_config())
