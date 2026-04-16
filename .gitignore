@@ -1,0 +1,35 @@
+# 環境變數（絕對不能上傳）
+.env
+*.pem
+credentials.json
+service_account.json
+*_credentials.json
+
+# Python 虛擬環境
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# 資料檔案（不放進 git，從 S3 讀取）
+*.parquet
+*.csv
+data/raw/
+data/cache/
+
+# Streamlit 快取
+.streamlit/cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
