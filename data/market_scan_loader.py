@@ -16,6 +16,7 @@ US industry 由 Tiingo API 補充，快取於：
 import logging
 import random
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -25,6 +26,9 @@ import config
 logger = logging.getLogger(__name__)
 
 BUCKET = config.S3_BUCKET_NAME
+
+# TW scan 本地快取（由 market_scan_fetcher 寫入，無需 S3 寫入權限）
+_TW_SCAN_LOCAL = Path(f"/tmp/tw_scan_{date.today().isoformat()}.parquet")
 
 # ── S3 路徑定義 ─────────────────────────────────────────
 # 每個 market 各試兩個路徑；最後還有一個合併路徑兜底
@@ -97,11 +101,16 @@ def _load_from_s3() -> pd.DataFrame:
 
     parts = []
 
-    # 1. 嘗試讀取 TW 分開路徑
-    tw_df = _try_paths(fs, _S3_PATHS_TW, market_tag="TW")
+    # 1. 嘗試讀取 TW 資料（優先 /tmp 本地快取，再 S3）
+    tw_df = _try_local_tw()
+    if tw_df is not None:
+        logger.info(f"TW 市場掃描載入（本地快取）：{len(tw_df)} 支")
+    else:
+        tw_df = _try_paths(fs, _S3_PATHS_TW, market_tag="TW")
+        if tw_df is not None:
+            logger.info(f"TW 市場掃描載入（S3）：{len(tw_df)} 支")
     if tw_df is not None:
         parts.append(tw_df)
-        logger.info(f"TW 市場掃描載入：{len(tw_df)} 支")
 
     # 2. 嘗試讀取 US 分開路徑
     us_df = _try_paths(fs, _S3_PATHS_US, market_tag="US")
@@ -127,6 +136,19 @@ def _load_from_s3() -> pd.DataFrame:
     df = _normalize(df)
     logger.info(f"市場掃描合併完成：TW {len(df[df['market']=='TW'])} + US {len(df[df['market']=='US'])} = {len(df)} 支")
     return df
+
+
+def _try_local_tw() -> Optional[pd.DataFrame]:
+    """嘗試從 /tmp 讀取今日 TW scan（由 fetcher 計算後存放）"""
+    if _TW_SCAN_LOCAL.exists():
+        try:
+            df = pd.read_parquet(str(_TW_SCAN_LOCAL))
+            if "market" not in df.columns or df["market"].isnull().all():
+                df["market"] = "TW"
+            return df
+        except Exception as e:
+            logger.warning(f"讀取本地 TW scan 失敗：{e}")
+    return None
 
 
 def _try_paths(fs, paths: list[str], market_tag: Optional[str]) -> Optional[pd.DataFrame]:

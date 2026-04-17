@@ -41,14 +41,23 @@ TW_DB_LOCAL     = Path("/tmp/tw_market_cache.db")
 TW_DB_DATE_FILE = Path("/tmp/tw_market_cache_date.txt")
 TW_DB_S3_KEY    = "db/latest/tw_market.db"
 
+# TW scan 結果存 /tmp（IAM 使用者為唯讀，無法寫入 S3）
+TW_SCAN_LOCAL   = Path(f"/tmp/tw_scan_{date.today().isoformat()}.parquet")
+
 
 # ════════════════════════════════════════════════════════
 # 公開介面
 # ════════════════════════════════════════════════════════
 
-def tw_scan_is_fresh(fs) -> bool:
-    """S3 的 TW scan 是否已是今天的資料"""
-    return _check_s3_date(fs, TW_LATEST_S3)
+def tw_scan_is_fresh(fs=None) -> bool:
+    """TW scan 是否已是今天的資料（優先檢查 /tmp，再檢查 S3）"""
+    # 先查本地 /tmp
+    if TW_SCAN_LOCAL.exists():
+        return True
+    # 再查 S3（若有 fs）
+    if fs is not None:
+        return _check_s3_date(fs, TW_LATEST_S3)
+    return False
 
 
 def run_tw_scan(fs) -> tuple[bool, str]:
@@ -77,8 +86,8 @@ def run_tw_scan(fs) -> tuple[bool, str]:
             return False, "特徵計算結果為空（資料可能不足）"
         logger.info(f"特徵計算完成：{len(scan_df)} 支有效股票")
 
-        # 4. 存至 S3
-        _save_to_s3(fs, scan_df, TW_LATEST_S3)
+        # 4. 存至 /tmp（IAM 唯讀，無法寫入 S3）
+        _save_to_local(scan_df, TW_SCAN_LOCAL)
         return True, f"台股掃描完成：{len(scan_df)} 支（資料來源：tw_market.db）"
 
     except Exception as e:
@@ -343,3 +352,10 @@ def _save_to_s3(fs, df: pd.DataFrame, s3_key: str) -> None:
     with fs.open(f"s3://{BUCKET}/{s3_key}", "wb") as f:
         f.write(buf.read())
     logger.info(f"已存至 s3://{BUCKET}/{s3_key}（{len(df)} 列）")
+
+
+def _save_to_local(df: pd.DataFrame, path: Path) -> None:
+    """存至本地 /tmp（無需 S3 寫入權限）"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(str(path), index=False, engine="pyarrow")
+    logger.info(f"已存至本地 {path}（{len(df)} 列）")

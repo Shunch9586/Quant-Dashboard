@@ -230,14 +230,13 @@ def _render_data_controls() -> None:
 
     with col_tw:
         try:
-            fs       = _get_fs()
-            is_fresh = tw_scan_is_fresh(fs)
+            is_fresh = tw_scan_is_fresh()   # 優先查 /tmp，不需 S3 權限
             if is_fresh:
                 st.success("✅ **台股** 資料已是今日")
             else:
                 st.warning("⏳ **台股** 資料待更新，請點「更新台股」")
         except Exception as e:
-            st.error(f"❌ **台股** S3 檢查失敗：{e}")
+            st.error(f"❌ **台股** 狀態檢查失敗：{e}")
 
     with col_us:
         st.info("ℹ️ **美股** 由 ETL pipeline 提供")
@@ -255,7 +254,7 @@ def _do_tw_refresh() -> None:
         st.write("⬇️ 確認 tw_market.db 快取（首次需下載 ~370MB）...")
         st.write("📊 讀取全市場近 310 天價格資料...")
         st.write("⚙️ 計算 MA50 / MA200 / Score（約 1,800 支股票）...")
-        st.write("☁️ 寫入 S3 快取...")
+        st.write("💾 儲存至本地快取...")
 
         try:
             fs      = _get_fs()
