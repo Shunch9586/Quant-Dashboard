@@ -1,20 +1,24 @@
 """
 市場掃描資料抓取器
-Dashboard 直接呼叫 API，計算特徵後存至 S3，不依賴 ETL pipeline。
 
-TW  → FinMind API (TaiwanStockPriceAdj + TaiwanStockInfo)
-US  → 讀 ETL 提供的 S3 Parquet，補充 Tiingo 的 sector/industry metadata
+TW 主要資料來源：tw_market.db（S3 SQLite，ETL 每日更新）
+  - 一個大型 SQL query 取全市場 300 天價格 + 股票名稱 + 產業別
+  - 計算特徵後存至 S3 作為每日快取
 
-執行策略：
-  1. 檢查 S3 是否已有今日資料 → 有就跳過
-  2. 沒有 → 呼叫 API → 計算特徵 → 存 S3
-  每次只在需要時執行，每天最多跑一次
+TW FinMind API（選配）：
+  - 若設定 FINMIND_API_TOKEN，改用 FinMind 抓每支股票歷史資料
+  - FinMind 的 TaiwanStockPriceAdj 需逐一指定 stock_id（不支援全市場一次抓）
+  - 目前預設用 SQLite，FinMind 預留但不主動使用
+
+US：由 ETL pipeline 提供，Tiingo 補充 industry metadata
 """
 
 import io
 import logging
+import sqlite3
 import time
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -25,12 +29,17 @@ from data.features import compute_features
 
 logger = logging.getLogger(__name__)
 
-BUCKET            = config.S3_BUCKET_NAME
-FINMIND_URL       = "https://api.finmindtrade.com/api/v4/data"
-TIINGO_META_URL   = "https://api.tiingo.com/tiingo/daily/{ticker}"
-FETCH_DAYS        = 300       # MA200 需要 200+ 天
-TW_LATEST_S3      = f"data_lake/market_scan/market=TW/latest/scan.parquet"
-US_INDUSTRY_S3    = f"data_lake/market_scan/us_industry_cache.parquet"
+BUCKET          = config.S3_BUCKET_NAME
+FETCH_DAYS      = 310        # 多取一點確保 MA200 夠用
+TW_LATEST_S3    = "data_lake/market_scan/market=TW/latest/scan.parquet"
+US_INDUSTRY_S3  = "data_lake/market_scan/us_industry_cache.parquet"
+FINMIND_URL     = "https://api.finmindtrade.com/api/v4/data"
+TIINGO_META_URL = "https://api.tiingo.com/tiingo/daily/{ticker}"
+
+# 複用 loader.py 的 SQLite 快取路徑（兩邊共用同一份檔案）
+TW_DB_LOCAL     = Path("/tmp/tw_market_cache.db")
+TW_DB_DATE_FILE = Path("/tmp/tw_market_cache_date.txt")
+TW_DB_S3_KEY    = "db/latest/tw_market.db"
 
 
 # ════════════════════════════════════════════════════════
@@ -39,70 +48,52 @@ US_INDUSTRY_S3    = f"data_lake/market_scan/us_industry_cache.parquet"
 
 def tw_scan_is_fresh(fs) -> bool:
     """S3 的 TW scan 是否已是今天的資料"""
-    return _check_date(fs, TW_LATEST_S3)
+    return _check_s3_date(fs, TW_LATEST_S3)
 
 
 def run_tw_scan(fs) -> tuple[bool, str]:
     """
-    執行 TW 市場掃描，結果存至 S3。
+    執行 TW 全市場掃描，結果存至 S3。
+    主要資料來源：S3 SQLite (tw_market.db)
     回傳 (成功?, 訊息)
-    需要 FINMIND_API_TOKEN 已設定。
     """
-    # 每次呼叫都即時讀取（不依賴模組快取）
-    if not _finmind_token():
-        return False, "FINMIND_API_TOKEN 未設定，請在 Streamlit Cloud Secrets 加入"
-
     try:
-        logger.info("開始 TW 市場掃描（FinMind）...")
+        logger.info("開始 TW 市場掃描（SQLite）...")
 
-        # 1. 取得股票清單 + 產業別
-        info_df = _fetch_tw_info()
-        logger.info(f"TaiwanStockInfo：{len(info_df)} 支股票")
+        # 1. 確保 SQLite 已下載（每日一次）
+        _ensure_tw_db(fs)
+        if not TW_DB_LOCAL.exists():
+            return False, "tw_market.db 不存在，請確認 ETL pipeline 已上傳"
 
-        # 2. 取得近 300 天價格（全市場，支援分頁）
-        price_df = _fetch_tw_prices()
+        # 2. 一次 SQL 撈全市場 FETCH_DAYS 天價格 + 股票資訊
+        price_df, info_df = _query_tw_db()
         if price_df.empty:
-            return False, "FinMind 回傳空的價格資料"
-        logger.info(f"TaiwanStockPriceAdj：{len(price_df)} 筆 / {price_df['stock_id'].nunique()} 支股票")
+            return False, "tw_market.db 中找不到價格資料"
+        logger.info(f"SQLite 讀取：{len(price_df)} 筆 / {price_df['stock_id'].nunique()} 支股票")
 
-        # 3. 計算特徵
+        # 3. 計算技術特徵
         scan_df = _compute_tw_scan(price_df, info_df)
+        if scan_df.empty:
+            return False, "特徵計算結果為空（資料可能不足）"
         logger.info(f"特徵計算完成：{len(scan_df)} 支有效股票")
 
         # 4. 存至 S3
         _save_to_s3(fs, scan_df, TW_LATEST_S3)
+        return True, f"台股掃描完成：{len(scan_df)} 支（資料來源：tw_market.db）"
 
-        return True, f"台股掃描完成，共 {len(scan_df)} 支"
-
-    except requests.exceptions.Timeout:
-        return False, "FinMind API 逾時，請稍後再試"
-    except requests.exceptions.HTTPError as e:
-        return False, f"FinMind API 錯誤：{e}"
     except Exception as e:
         logger.exception("TW scan 失敗")
         return False, f"發生錯誤：{e}"
 
 
-def _finmind_token() -> str:
-    """每次呼叫都從 secrets 即時讀取 FinMind token"""
-    return config.fresh("FINMIND_API_TOKEN") or config.fresh("FINMIND_API_KEY")
-
-
-def _tiingo_key() -> str:
-    """每次呼叫都從 secrets 即時讀取 Tiingo key"""
-    return config.fresh("TIINGO_API_KEY")
-
-
 def enrich_us_industry(fs, symbols: list[str]) -> pd.DataFrame:
     """
     用 Tiingo 補充 US 股票的 industry / sector。
-    回傳 DataFrame: symbol, name, sector, industry
-    自動快取結果至 S3，只呼叫沒有快取的 symbol。
+    自動快取至 S3，只呼叫尚未快取的 symbol。
     """
     if not _tiingo_key():
         return pd.DataFrame(columns=["symbol", "name", "sector", "industry"])
 
-    # 讀現有快取
     cached = _load_us_industry_cache(fs)
     cached_symbols = set(cached["symbol"].tolist()) if not cached.empty else set()
     missing = [s for s in symbols if s not in cached_symbols]
@@ -118,11 +109,10 @@ def enrich_us_industry(fs, symbols: list[str]) -> pd.DataFrame:
             new_rows.append(row)
         if i > 0 and i % 50 == 0:
             logger.info(f"  進度 {i}/{len(missing)}")
-            time.sleep(0.5)   # 避免 rate limit
+            time.sleep(0.5)
 
     if new_rows:
-        new_df  = pd.DataFrame(new_rows)
-        combined = pd.concat([cached, new_df], ignore_index=True)
+        combined = pd.concat([cached, pd.DataFrame(new_rows)], ignore_index=True)
         combined = combined.drop_duplicates("symbol", keep="last")
         _save_to_s3(fs, combined, US_INDUSTRY_S3)
         return combined
@@ -131,122 +121,119 @@ def enrich_us_industry(fs, symbols: list[str]) -> pd.DataFrame:
 
 
 # ════════════════════════════════════════════════════════
-# FinMind — TW
+# SQLite 資料讀取
 # ════════════════════════════════════════════════════════
 
-def _fetch_tw_info() -> pd.DataFrame:
-    """TaiwanStockInfo：股票名稱 + 產業別"""
-    resp = _finmind_get("TaiwanStockInfo", {})
-    if resp is None or resp.empty:
-        return pd.DataFrame(columns=["stock_id", "stock_name", "industry_category"])
-    # 保留普通股 + ETF
-    keep_types = {"twse", "tpex", "ETF", "stock", "上市", "上櫃"}
-    if "type" in resp.columns:
-        resp = resp[resp["type"].apply(lambda t: str(t).lower() in {x.lower() for x in keep_types})]
-    return resp[["stock_id", "stock_name", "industry_category"]].drop_duplicates("stock_id")
+def _ensure_tw_db(fs) -> None:
+    """
+    確保本地 SQLite 快取是今天的版本。
+    與 loader.py 的 _ensure_tw_db 邏輯相同，但接受 fs 參數。
+    """
+    today_str = date.today().isoformat()
+
+    if TW_DB_LOCAL.exists() and TW_DB_DATE_FILE.exists():
+        if TW_DB_DATE_FILE.read_text().strip() == today_str:
+            logger.info("tw_market.db 已是今日版本，跳過下載")
+            return
+
+    logger.info("下載 tw_market.db（約 370MB）...")
+    import boto3
+    import botocore
+    kwargs = {"region_name": config.AWS_REGION}
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"]     = config.AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = config.AWS_SECRET_ACCESS_KEY
+    s3 = boto3.client("s3", **kwargs)
+    s3.download_file(BUCKET, TW_DB_S3_KEY, str(TW_DB_LOCAL))
+    TW_DB_DATE_FILE.write_text(today_str)
+    logger.info("tw_market.db 下載完成")
 
 
-def _fetch_tw_prices() -> pd.DataFrame:
-    """TaiwanStockPriceAdj：近 FETCH_DAYS 天全市場調整後收盤（支援 FinMind 分頁）"""
-    start = (date.today() - timedelta(days=FETCH_DAYS)).isoformat()
-    end   = date.today().isoformat()
-
-    frames = []
-    page   = 1
-    while True:
-        chunk = _finmind_get("TaiwanStockPriceAdj", {
-            "start_date": start,
-            "end_date":   end,
-            "page":       page,
-        })
-        if chunk is None or chunk.empty:
-            break
-        frames.append(chunk)
-        logger.info(f"  FinMind page {page}：{len(chunk)} 筆")
-        # FinMind 每頁上限通常 30,000 筆，小於 1,000 代表已是最後頁
-        if len(chunk) < 1000:
-            break
-        page += 1
-        time.sleep(0.3)   # 禮貌性等待
-
-    if not frames:
-        return pd.DataFrame()
-
-    df = pd.concat(frames, ignore_index=True)
-    df["date"] = pd.to_datetime(df["date"])
-    # FinMind 的 TaiwanStockPriceAdj close 就是權息調整後收盤
-    df = df.rename(columns={"close": "adj_close"})
-    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
-
-
-def _finmind_get(dataset: str, extra_params: dict) -> Optional[pd.DataFrame]:
-    """統一的 FinMind GET，回傳 DataFrame 或 None"""
-    params = {
-        "dataset": dataset,
-        "token":   _finmind_token(),
-        **extra_params,
-    }
+def _query_tw_db() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    一次 SQL query 取：
+    - price_df: 全市場近 FETCH_DAYS 天價格（stock_id, date, adj_close, volume）
+    - info_df:  股票清單（stock_id, stock_name, industry_category）
+    """
+    start_date = (date.today() - timedelta(days=FETCH_DAYS)).isoformat()
+    conn = sqlite3.connect(str(TW_DB_LOCAL))
     try:
-        resp = requests.get(FINMIND_URL, params=params, timeout=120)
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") != 200:
-            logger.warning(f"FinMind {dataset} status={body.get('status')}: {body.get('msg')}")
-            return None
-        data = body.get("data", [])
-        return pd.DataFrame(data) if data else pd.DataFrame()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"FinMind {dataset} 請求失敗：{e}")
-        return None
+        price_df = pd.read_sql(
+            """
+            SELECT stock_id, date, adj_close, volume
+            FROM   price
+            WHERE  date >= ?
+            ORDER  BY stock_id, date
+            """,
+            conn,
+            params=(start_date,),
+        )
+        info_df = pd.read_sql(
+            "SELECT stock_id, stock_name, industry_category FROM stock_info",
+            conn,
+        )
+    finally:
+        conn.close()
+
+    price_df["date"] = pd.to_datetime(price_df["date"])
+    return price_df, info_df
 
 
 # ════════════════════════════════════════════════════════
-# 特徵計算 — TW
+# 技術特徵計算（TW）
 # ════════════════════════════════════════════════════════
 
 def _compute_tw_scan(price_df: pd.DataFrame, info_df: pd.DataFrame) -> pd.DataFrame:
-    """對每支股票計算技術特徵，回傳 scan DataFrame"""
-    # stock_id → {name, industry} lookup
+    """
+    對每支股票計算技術特徵，回傳 scan DataFrame。
+    price_df 必須有欄位：stock_id, date, adj_close, volume
+    info_df  必須有欄位：stock_id, stock_name, industry_category
+    """
+    # stock_id → info lookup
     info_map: dict[str, dict] = {}
     if not info_df.empty:
         for _, r in info_df.iterrows():
             sid = str(r["stock_id"])
+            industry = str(r.get("industry_category") or "未分類").strip() or "未分類"
             info_map[sid] = {
-                "name":     str(r.get("stock_name", sid)),
-                "industry": str(r.get("industry_category", "") or "未分類").strip() or "未分類",
+                "name":     str(r.get("stock_name") or sid),
+                "industry": industry,
             }
 
     rows = []
-    for stock_id, grp in price_df.groupby("stock_id"):
-        sid  = str(stock_id)
-        grp  = grp.sort_values("date").reset_index(drop=True)
+    groups = price_df.groupby("stock_id", sort=False)
+    total  = len(groups)
+
+    for idx, (stock_id, grp) in enumerate(groups):
+        sid = str(stock_id)
+        grp = grp.sort_values("date").reset_index(drop=True)
 
         if len(grp) < 20:
             continue
 
-        # compute_features 需要 adj_close 欄位
         try:
             feats = compute_features(grp)
         except Exception as e:
             logger.debug(f"{sid} 特徵計算失敗：{e}")
             continue
 
-        last    = grp.iloc[-1]
-        close   = float(last["adj_close"])
-        vol     = float(last["volume"]) if "volume" in grp.columns else 0.0
-        info    = info_map.get(sid, {"name": sid, "industry": "未分類"})
-
-        ma50    = feats["ma50"]
-        ma200   = feats["ma200"]
-        avg_vol = feats["avg_volume_20d"]
+        last     = grp.iloc[-1]
+        close    = float(last["adj_close"])
+        vol      = float(last["volume"]) if "volume" in grp.columns else 0.0
+        info     = info_map.get(sid, {"name": sid, "industry": "未分類"})
+        avg_vol  = feats["avg_volume_20d"]
+        ma50     = feats["ma50"]
+        ma200    = feats["ma200"]
 
         above_ma50  = close > ma50  if ma50  > 0 else False
         above_ma200 = close > ma200 if ma200 > 0 else False
         ma50_above  = ma50 > ma200  if ma50  > 0 and ma200 > 0 else False
 
-        trend = ("bull" if (above_ma50 and above_ma200 and ma50_above)
-                 else "bear" if (not above_ma50 and not above_ma200 and not ma50_above)
-                 else "mixed")
+        trend = (
+            "bull"  if (above_ma50 and above_ma200 and ma50_above) else
+            "bear"  if (not above_ma50 and not above_ma200 and not ma50_above) else
+            "mixed"
+        )
 
         high_52w  = grp["adj_close"].tail(252).max()
         dist_52w  = (close - high_52w) / high_52w if high_52w > 0 else 0.0
@@ -285,6 +272,9 @@ def _compute_tw_scan(price_df: pd.DataFrame, info_df: pd.DataFrame) -> pd.DataFr
             "reversal_flag":      False,
         })
 
+        if idx % 200 == 0:
+            logger.info(f"  特徵計算進度：{idx}/{total}")
+
     return pd.DataFrame(rows)
 
 
@@ -292,8 +282,15 @@ def _compute_tw_scan(price_df: pd.DataFrame, info_df: pd.DataFrame) -> pd.DataFr
 # Tiingo — US industry metadata
 # ════════════════════════════════════════════════════════
 
+def _tiingo_key() -> str:
+    return config.fresh("TIINGO_API_KEY")
+
+
+def _finmind_token() -> str:
+    return config.fresh("FINMIND_API_TOKEN") or config.fresh("FINMIND_API_KEY")
+
+
 def _fetch_tiingo_meta(symbol: str) -> Optional[dict]:
-    """取得單一美股的 name / sector / industry"""
     try:
         url  = TIINGO_META_URL.format(ticker=symbol.lower())
         resp = requests.get(
@@ -309,17 +306,15 @@ def _fetch_tiingo_meta(symbol: str) -> Optional[dict]:
             "symbol":   symbol.upper(),
             "name":     d.get("name", symbol),
             "sector":   d.get("sector", ""),
-            "industry": d.get("industry", d.get("sector", "未分類")) or "未分類",
+            "industry": d.get("industry") or d.get("sector") or "未分類",
         }
     except Exception:
         return None
 
 
 def _load_us_industry_cache(fs) -> pd.DataFrame:
-    """讀取 US industry 快取"""
     try:
-        path = f"s3://{BUCKET}/{US_INDUSTRY_S3}"
-        with fs.open(path, "rb") as f:
+        with fs.open(f"s3://{BUCKET}/{US_INDUSTRY_S3}", "rb") as f:
             return pd.read_parquet(f)
     except Exception:
         return pd.DataFrame(columns=["symbol", "name", "sector", "industry"])
@@ -329,25 +324,22 @@ def _load_us_industry_cache(fs) -> pd.DataFrame:
 # S3 工具
 # ════════════════════════════════════════════════════════
 
-def _check_date(fs, s3_key: str) -> bool:
-    """S3 檔案的 date 欄位最大值是否是今天"""
+def _check_s3_date(fs, s3_key: str) -> bool:
+    """S3 檔案的 date 欄位最大值是否 >= 今天"""
     try:
         with fs.open(f"s3://{BUCKET}/{s3_key}", "rb") as f:
             df = pd.read_parquet(f, columns=["date"])
         if not df.empty:
-            latest = pd.to_datetime(df["date"]).max().date()
-            return latest >= date.today()
+            return pd.to_datetime(df["date"]).max().date() >= date.today()
     except Exception:
         pass
     return False
 
 
 def _save_to_s3(fs, df: pd.DataFrame, s3_key: str) -> None:
-    """儲存 DataFrame 至 S3（parquet 格式）"""
     buf = io.BytesIO()
     df.to_parquet(buf, index=False, engine="pyarrow")
     buf.seek(0)
-    path = f"s3://{BUCKET}/{s3_key}"
-    with fs.open(path, "wb") as f:
+    with fs.open(f"s3://{BUCKET}/{s3_key}", "wb") as f:
         f.write(buf.read())
-    logger.info(f"已存至 {path}（{len(df)} 列）")
+    logger.info(f"已存至 s3://{BUCKET}/{s3_key}（{len(df)} 列）")

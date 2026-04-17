@@ -226,34 +226,24 @@ def _render_data_controls() -> None:
 
     from data.market_scan_fetcher import tw_scan_is_fresh
 
-    # 每次 render 都即時讀 secrets（不用模組快取）
-    finmind_token = config.fresh("FINMIND_API_TOKEN") or config.fresh("FINMIND_API_KEY")
-    has_token     = bool(finmind_token)
-
     col_tw, col_us, col_refresh = st.columns([3, 3, 2])
 
-    # TW 狀態
     with col_tw:
-        if not has_token:
-            st.warning("⚠️ **台股**：請在 Streamlit Cloud Secrets 加入 `FINMIND_API_TOKEN`")
-        else:
-            try:
-                fs         = _get_fs()
-                is_fresh   = tw_scan_is_fresh(fs)
-                if is_fresh:
-                    st.success("✅ **台股** 資料已是今日")
-                else:
-                    st.warning("⏳ **台股** 資料待更新，請點「更新台股」")
-            except Exception as e:
-                st.error(f"❌ **台股** S3 檢查失敗：{e}")
+        try:
+            fs       = _get_fs()
+            is_fresh = tw_scan_is_fresh(fs)
+            if is_fresh:
+                st.success("✅ **台股** 資料已是今日")
+            else:
+                st.warning("⏳ **台股** 資料待更新，請點「更新台股」")
+        except Exception as e:
+            st.error(f"❌ **台股** S3 檢查失敗：{e}")
 
-    # US 狀態（由 ETL 提供）
     with col_us:
         st.info("ℹ️ **美股** 由 ETL pipeline 提供")
 
-    # 更新按鈕
     with col_refresh:
-        if st.button("🔄 更新台股", key="scan_tw_refresh", disabled=not has_token):
+        if st.button("🔄 更新台股", key="scan_tw_refresh"):
             _do_tw_refresh()
 
 
@@ -261,10 +251,11 @@ def _do_tw_refresh() -> None:
     """執行 TW 掃描更新，顯示進度"""
     from data.market_scan_fetcher import run_tw_scan
 
-    with st.status("📡 從 FinMind 更新台股資料...", expanded=True) as status:
-        st.write("🔍 抓取股票清單（TaiwanStockInfo）...")
-        st.write("📈 抓取近 300 天調整後收盤（TaiwanStockPriceAdj）...")
-        st.write("⚙️ 計算 MA50 / MA200 / Score 等技術指標...")
+    with st.status("🗄️ 從 tw_market.db 更新台股資料...", expanded=True) as status:
+        st.write("⬇️ 確認 tw_market.db 快取（首次需下載 ~370MB）...")
+        st.write("📊 讀取全市場近 310 天價格資料...")
+        st.write("⚙️ 計算 MA50 / MA200 / Score（約 1,800 支股票）...")
+        st.write("☁️ 寫入 S3 快取...")
 
         try:
             fs      = _get_fs()
