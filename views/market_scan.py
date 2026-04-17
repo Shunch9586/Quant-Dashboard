@@ -226,32 +226,34 @@ def _render_data_controls() -> None:
 
     from data.market_scan_fetcher import tw_scan_is_fresh
 
+    # 每次 render 都即時讀 secrets（不用模組快取）
+    finmind_token = config.fresh("FINMIND_API_TOKEN") or config.fresh("FINMIND_API_KEY")
+    has_token     = bool(finmind_token)
+
     col_tw, col_us, col_refresh = st.columns([3, 3, 2])
 
     # TW 狀態
     with col_tw:
-        has_token = bool(config.FINMIND_API_TOKEN)
         if not has_token:
-            st.warning("⚠️ **台股**：未設定 FINMIND_API_TOKEN")
+            st.warning("⚠️ **台股**：請在 Streamlit Cloud Secrets 加入 `FINMIND_API_TOKEN`")
         else:
             try:
-                fs = _get_fs()
-                fresh = tw_scan_is_fresh(fs)
-                if fresh:
+                fs         = _get_fs()
+                is_fresh   = tw_scan_is_fresh(fs)
+                if is_fresh:
                     st.success("✅ **台股** 資料已是今日")
                 else:
-                    st.warning("⏳ **台股** 資料待更新")
-            except Exception:
-                st.error("❌ **台股** 無法檢查 S3")
+                    st.warning("⏳ **台股** 資料待更新，請點「更新台股」")
+            except Exception as e:
+                st.error(f"❌ **台股** S3 檢查失敗：{e}")
 
-    # US 狀態（由 ETL 提供，簡單顯示）
+    # US 狀態（由 ETL 提供）
     with col_us:
         st.info("ℹ️ **美股** 由 ETL pipeline 提供")
 
     # 更新按鈕
     with col_refresh:
-        if st.button("🔄 更新台股", key="scan_tw_refresh",
-                     disabled=not bool(config.FINMIND_API_TOKEN)):
+        if st.button("🔄 更新台股", key="scan_tw_refresh", disabled=not has_token):
             _do_tw_refresh()
 
 

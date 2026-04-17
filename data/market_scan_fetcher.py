@@ -48,7 +48,8 @@ def run_tw_scan(fs) -> tuple[bool, str]:
     回傳 (成功?, 訊息)
     需要 FINMIND_API_TOKEN 已設定。
     """
-    if not config.FINMIND_API_TOKEN:
+    # 每次呼叫都即時讀取（不依賴模組快取）
+    if not _finmind_token():
         return False, "FINMIND_API_TOKEN 未設定，請在 Streamlit Cloud Secrets 加入"
 
     try:
@@ -82,13 +83,23 @@ def run_tw_scan(fs) -> tuple[bool, str]:
         return False, f"發生錯誤：{e}"
 
 
+def _finmind_token() -> str:
+    """每次呼叫都從 secrets 即時讀取 FinMind token"""
+    return config.fresh("FINMIND_API_TOKEN") or config.fresh("FINMIND_API_KEY")
+
+
+def _tiingo_key() -> str:
+    """每次呼叫都從 secrets 即時讀取 Tiingo key"""
+    return config.fresh("TIINGO_API_KEY")
+
+
 def enrich_us_industry(fs, symbols: list[str]) -> pd.DataFrame:
     """
     用 Tiingo 補充 US 股票的 industry / sector。
     回傳 DataFrame: symbol, name, sector, industry
     自動快取結果至 S3，只呼叫沒有快取的 symbol。
     """
-    if not config.TIINGO_API_KEY:
+    if not _tiingo_key():
         return pd.DataFrame(columns=["symbol", "name", "sector", "industry"])
 
     # 讀現有快取
@@ -172,7 +183,7 @@ def _finmind_get(dataset: str, extra_params: dict) -> Optional[pd.DataFrame]:
     """統一的 FinMind GET，回傳 DataFrame 或 None"""
     params = {
         "dataset": dataset,
-        "token":   config.FINMIND_API_TOKEN,
+        "token":   _finmind_token(),
         **extra_params,
     }
     try:
@@ -287,7 +298,7 @@ def _fetch_tiingo_meta(symbol: str) -> Optional[dict]:
         url  = TIINGO_META_URL.format(ticker=symbol.lower())
         resp = requests.get(
             url,
-            headers={"Authorization": f"Token {config.TIINGO_API_KEY}"},
+            headers={"Authorization": f"Token {_tiingo_key()}"},
             timeout=10,
         )
         if resp.status_code == 404:

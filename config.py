@@ -20,6 +20,14 @@ def _get(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+def fresh(key: str, default: str = "") -> str:
+    """
+    每次呼叫都即時讀取（不依賴模組快取）。
+    適合在 view / fetcher 層使用，確保 secrets 更新後立即生效。
+    """
+    return _get(key, default)
+
+
 # ── AWS S3 ───────────────────────────────────────────────
 AWS_ACCESS_KEY_ID     = _get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = _get("AWS_SECRET_ACCESS_KEY")
