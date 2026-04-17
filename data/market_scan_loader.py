@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 
 BUCKET = config.S3_BUCKET_NAME
 
-# 本地快取路徑（由各自的 fetcher 寫入，無需 S3 寫入權限）
-_TW_SCAN_LOCAL = Path(f"/tmp/tw_scan_{date.today().isoformat()}.parquet")
-_US_SCAN_LOCAL = Path(f"/tmp/us_scan_{date.today().isoformat()}.parquet")
+# 本地快取路徑（固定檔名，freshness 由各 fetcher 的 date file 控管）
+_TW_SCAN_LOCAL = Path("/tmp/tw_scan_latest.parquet")
+_US_SCAN_LOCAL = Path("/tmp/us_scan_latest.parquet")
 
 # ── S3 路徑定義 ─────────────────────────────────────────
 # 每個 market 各試兩個路徑；最後還有一個合併路徑兜底

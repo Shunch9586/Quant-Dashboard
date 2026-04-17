@@ -41,8 +41,10 @@ TW_DB_LOCAL     = Path("/tmp/tw_market_cache.db")
 TW_DB_DATE_FILE = Path("/tmp/tw_market_cache_date.txt")
 TW_DB_S3_KEY    = "db/latest/tw_market.db"
 
-# TW scan 結果存 /tmp（IAM 使用者為唯讀，無法寫入 S3）
-TW_SCAN_LOCAL   = Path(f"/tmp/tw_scan_{date.today().isoformat()}.parquet")
+# TW scan 結果存 /tmp（固定檔名，附日期 metadata）
+TW_SCAN_LOCAL     = Path("/tmp/tw_scan_latest.parquet")
+TW_SCAN_DATE_FILE = Path("/tmp/tw_scan_latest_date.txt")
+TW_SCAN_MAX_AGE_DAYS = 3   # 週末 / 假日沿用最近 3 天內的資料
 
 
 # ════════════════════════════════════════════════════════
@@ -50,14 +52,29 @@ TW_SCAN_LOCAL   = Path(f"/tmp/tw_scan_{date.today().isoformat()}.parquet")
 # ════════════════════════════════════════════════════════
 
 def tw_scan_is_fresh(fs=None) -> bool:
-    """TW scan 是否已是今天的資料（優先檢查 /tmp，再檢查 S3）"""
+    """TW scan 是否在有效期內（優先查 /tmp，再查 S3）"""
     # 先查本地 /tmp
-    if TW_SCAN_LOCAL.exists():
-        return True
-    # 再查 S3（若有 fs）
+    if TW_SCAN_LOCAL.exists() and TW_SCAN_DATE_FILE.exists():
+        try:
+            scan_date = date.fromisoformat(TW_SCAN_DATE_FILE.read_text().strip())
+            if (date.today() - scan_date).days <= TW_SCAN_MAX_AGE_DAYS:
+                return True
+        except Exception:
+            pass
+    # 再查 S3
     if fs is not None:
         return _check_s3_date(fs, TW_LATEST_S3)
     return False
+
+
+def get_tw_scan_date() -> Optional[str]:
+    """回傳上次掃描日期字串，供 UI 顯示用"""
+    if TW_SCAN_DATE_FILE.exists():
+        try:
+            return TW_SCAN_DATE_FILE.read_text().strip()
+        except Exception:
+            pass
+    return None
 
 
 def run_tw_scan(fs) -> tuple[bool, str]:
@@ -86,9 +103,10 @@ def run_tw_scan(fs) -> tuple[bool, str]:
             return False, "特徵計算結果為空（資料可能不足）"
         logger.info(f"特徵計算完成：{len(scan_df)} 支有效股票")
 
-        # 4. 存至 /tmp（IAM 唯讀，無法寫入 S3）
+        # 4. 存至 /tmp（固定路徑 + 日期記錄）
         _save_to_local(scan_df, TW_SCAN_LOCAL)
-        return True, f"台股掃描完成：{len(scan_df)} 支（資料來源：tw_market.db）"
+        TW_SCAN_DATE_FILE.write_text(date.today().isoformat())
+        return True, f"台股掃描完成：{len(scan_df)} 支（有效期 {TW_SCAN_MAX_AGE_DAYS} 天）"
 
     except Exception as e:
         logger.exception("TW scan 失敗")

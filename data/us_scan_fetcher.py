@@ -6,12 +6,13 @@ US 全市場掃描器
   - 價格歷史：yfinance 批次下載（免費，無需 API Key）
   - 產業分類：Tiingo metadata（有 TIINGO_API_KEY 時啟用，本地快取）
 
-輸出：/tmp/us_scan_{today}.parquet
+輸出：/tmp/us_scan_latest.parquet（固定檔名，附日期 metadata）
+有效期：US_SCAN_MAX_AGE_DAYS 天內不重下（週末 / 假日自動沿用）
 """
 
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Callable, Optional
@@ -26,8 +27,10 @@ from data.features import compute_features
 logger = logging.getLogger(__name__)
 
 # ── 常數 ─────────────────────────────────────────────────
-US_SCAN_LOCAL     = Path(f"/tmp/us_scan_{date.today().isoformat()}.parquet")
-US_IND_CACHE      = Path("/tmp/us_industry_cache.parquet")  # 本地快取（跨日保存）
+US_SCAN_LOCAL     = Path("/tmp/us_scan_latest.parquet")      # 固定檔名（不含日期）
+US_SCAN_DATE_FILE = Path("/tmp/us_scan_latest_date.txt")     # 記錄上次掃描日期
+US_IND_CACHE      = Path("/tmp/us_industry_cache.parquet")   # 産業快取（跨日保存）
+US_SCAN_MAX_AGE_DAYS = 3   # 允許最多 3 天不重下（涵蓋週末 + 假日）
 
 NASDAQ_LISTED_URL = "https://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt"
 OTHER_LISTED_URL  = "https://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.txt"
@@ -45,8 +48,27 @@ MAX_IND_FETCH     = 800      # Tiingo 每次最多補充多少産業資訊
 # ════════════════════════════════════════════════════════
 
 def us_scan_is_fresh() -> bool:
-    """今日 US scan 是否已存在 /tmp"""
-    return US_SCAN_LOCAL.exists()
+    """
+    US scan 是否在有效期內（US_SCAN_MAX_AGE_DAYS 天）。
+    週末 / 假日自動沿用最近一次掃描結果，不強制每日重下。
+    """
+    if not US_SCAN_LOCAL.exists() or not US_SCAN_DATE_FILE.exists():
+        return False
+    try:
+        scan_date = date.fromisoformat(US_SCAN_DATE_FILE.read_text().strip())
+        return (date.today() - scan_date).days <= US_SCAN_MAX_AGE_DAYS
+    except Exception:
+        return False
+
+
+def get_us_scan_date() -> Optional[str]:
+    """回傳上次掃描日期字串，供 UI 顯示用"""
+    if US_SCAN_DATE_FILE.exists():
+        try:
+            return US_SCAN_DATE_FILE.read_text().strip()
+        except Exception:
+            pass
+    return None
 
 
 def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, str]:
@@ -87,9 +109,10 @@ def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, 
         _p("🏷️  補充産業分類（Tiingo，優先高分股）...")
         scan_df = _enrich_industry(scan_df, max_fetch=MAX_IND_FETCH)
 
-        # ⑤ 儲存
+        # ⑤ 儲存（固定路徑 + 日期記錄）
         scan_df.to_parquet(str(US_SCAN_LOCAL), index=False, engine="pyarrow")
-        _p(f"💾 儲存至本地快取（{len(scan_df)} 支）")
+        US_SCAN_DATE_FILE.write_text(date.today().isoformat())
+        _p(f"💾 儲存至本地快取（{len(scan_df)} 支，有效期 {US_SCAN_MAX_AGE_DAYS} 天）")
 
         return True, f"美股掃描完成：{len(scan_df)} 支（全市場覆蓋）"
 

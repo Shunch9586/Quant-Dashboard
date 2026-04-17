@@ -224,15 +224,17 @@ def _render_data_controls() -> None:
         st.caption("🧪 Mock 模式：顯示假資料")
         return
 
-    from data.market_scan_fetcher import tw_scan_is_fresh
-    from data.us_scan_fetcher    import us_scan_is_fresh
+    from data.market_scan_fetcher import tw_scan_is_fresh, get_tw_scan_date
+    from data.us_scan_fetcher    import us_scan_is_fresh, get_us_scan_date
 
     col_tw, col_us, col_tw_btn, col_us_btn = st.columns([3, 3, 1.5, 1.5])
 
     with col_tw:
         try:
+            scan_date = get_tw_scan_date()
+            date_hint = f"（{scan_date}）" if scan_date else ""
             if tw_scan_is_fresh():
-                st.success("✅ **台股** 資料已是今日")
+                st.success(f"✅ **台股** 有效{date_hint}")
             else:
                 st.warning("⏳ **台股** 待更新")
         except Exception as e:
@@ -240,8 +242,10 @@ def _render_data_controls() -> None:
 
     with col_us:
         try:
+            scan_date = get_us_scan_date()
+            date_hint = f"（{scan_date}）" if scan_date else ""
             if us_scan_is_fresh():
-                st.success("✅ **美股** 資料已是今日（全市場）")
+                st.success(f"✅ **美股** 有效{date_hint}（全市場）")
             else:
                 st.warning("⏳ **美股** 待更新（ETL ~3,000 支）")
         except Exception as e:
