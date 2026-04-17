@@ -1,15 +1,20 @@
 """
 市場掃描資料載入器
-- USE_MOCK_DATA=true  → 產生假資料（開發用）
-- USE_MOCK_DATA=false → 從 S3 讀取 ETL pipeline 輸出的 scan.parquet
+支援 TW / US 分開儲存，自動嘗試多個 S3 路徑後合併。
 
-S3 路徑：s3://hanetic-quant-data-2026/data_lake/market_scan/latest/scan.parquet
-Schema 由 ETL pipeline 的 full_market_scan.py 決定，此處只做讀取與型別確保。
+━━ S3 路徑優先順序（每個 market 各自嘗試）━━
+  1. data_lake/market_scan/market={TW|US}/latest/scan.parquet  ← 分開存（優先）
+  2. data_lake/market_scan/market={TW|US}/scan.parquet         ← 無 latest 子目錄
+  3. data_lake/market_scan/latest/scan.parquet                 ← 合併存（fallback）
+
+TW 約 1,800 支（全量）
+US 約 3,000 支（ETL pre-filtered，非全市場 20,000+，這是設計行為）
 """
 
 import logging
 import random
 from datetime import date, timedelta
+from typing import Optional
 
 import pandas as pd
 
@@ -17,9 +22,21 @@ import config
 
 logger = logging.getLogger(__name__)
 
-S3_SCAN_PATH = f"s3://{config.S3_BUCKET_NAME}/data_lake/market_scan/latest/scan.parquet"
+BUCKET = config.S3_BUCKET_NAME
 
-# 欄位型別保證（ETL 輸出不一定嚴格，這裡做防禦）
+# ── S3 路徑定義 ─────────────────────────────────────────
+# 每個 market 各試兩個路徑；最後還有一個合併路徑兜底
+_S3_PATHS_TW = [
+    f"s3://{BUCKET}/data_lake/market_scan/market=TW/latest/scan.parquet",
+    f"s3://{BUCKET}/data_lake/market_scan/market=TW/scan.parquet",
+]
+_S3_PATHS_US = [
+    f"s3://{BUCKET}/data_lake/market_scan/market=US/latest/scan.parquet",
+    f"s3://{BUCKET}/data_lake/market_scan/market=US/scan.parquet",
+]
+_S3_PATH_COMBINED = f"s3://{BUCKET}/data_lake/market_scan/latest/scan.parquet"
+
+# ── 欄位型別保證 ─────────────────────────────────────────
 _DTYPE_MAP = {
     "symbol":             "str",
     "name":               "str",
@@ -49,11 +66,16 @@ _DTYPE_MAP = {
 }
 
 
+# ════════════════════════════════════════════════════════
+# 公開介面
+# ════════════════════════════════════════════════════════
+
 def load_market_scan() -> pd.DataFrame:
     """
-    載入全市場掃描結果。
-    回傳 DataFrame，每列一支股票。
-    如果 S3 尚無資料（ETL 尚未產出），回傳空 DataFrame + 顯示提示。
+    載入全市場掃描結果（TW + US 合併）。
+    - TW 和 US 各自從獨立路徑讀取，找不到才 fallback 到合併路徑
+    - 任一市場有資料就算成功，兩個都有就合併
+    - 完全找不到才回傳空 DataFrame
     """
     if config.USE_MOCK_DATA:
         return _mock_scan()
@@ -61,60 +83,101 @@ def load_market_scan() -> pd.DataFrame:
 
 
 # ════════════════════════════════════════════════════════
-# 真實資料（S3）
+# S3 讀取（多路徑策略）
 # ════════════════════════════════════════════════════════
 
 def _load_from_s3() -> pd.DataFrame:
-    try:
-        import s3fs
-        fs = s3fs.S3FileSystem(
-            key=config.AWS_ACCESS_KEY_ID or None,
-            secret=config.AWS_SECRET_ACCESS_KEY or None,
-        )
-        with fs.open(S3_SCAN_PATH, "rb") as f:
-            df = pd.read_parquet(f)
-        df = _normalize(df)
-        logger.info(f"市場掃描載入完成：{len(df)} 支股票")
-        return df
-    except FileNotFoundError:
-        logger.warning("market_scan/latest/scan.parquet 尚不存在，ETL pipeline 尚未產出")
-        return pd.DataFrame()
-    except Exception as e:
-        logger.error(f"市場掃描 S3 讀取失敗：{e}")
+    import s3fs
+    fs = s3fs.S3FileSystem(
+        key=config.AWS_ACCESS_KEY_ID or None,
+        secret=config.AWS_SECRET_ACCESS_KEY or None,
+    )
+
+    parts = []
+
+    # 1. 嘗試讀取 TW 分開路徑
+    tw_df = _try_paths(fs, _S3_PATHS_TW, market_tag="TW")
+    if tw_df is not None:
+        parts.append(tw_df)
+        logger.info(f"TW 市場掃描載入：{len(tw_df)} 支")
+
+    # 2. 嘗試讀取 US 分開路徑
+    us_df = _try_paths(fs, _S3_PATHS_US, market_tag="US")
+    if us_df is not None:
+        parts.append(us_df)
+        logger.info(f"US 市場掃描載入：{len(us_df)} 支（ETL pre-filtered）")
+
+    # 3. 若兩個分開路徑都找不到，嘗試合併路徑
+    if not parts:
+        combined = _try_paths(fs, [_S3_PATH_COMBINED], market_tag=None)
+        if combined is not None:
+            parts.append(combined)
+            logger.info(f"合併市場掃描載入：{len(combined)} 支")
+
+    if not parts:
+        logger.warning("所有 S3 路徑均找不到 scan.parquet，請確認 ETL pipeline 已執行")
         return pd.DataFrame()
 
+    # 4. 合併 + 去重（以 symbol 為主鍵，同一支股票以後出現的覆蓋前面）
+    df = pd.concat(parts, ignore_index=True)
+    df = df.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+
+    df = _normalize(df)
+    logger.info(f"市場掃描合併完成：TW {len(df[df['market']=='TW'])} + US {len(df[df['market']=='US'])} = {len(df)} 支")
+    return df
+
+
+def _try_paths(fs, paths: list[str], market_tag: Optional[str]) -> Optional[pd.DataFrame]:
+    """依序嘗試 paths，第一個成功的就回傳；全部失敗回傳 None"""
+    for path in paths:
+        try:
+            with fs.open(path, "rb") as f:
+                df = pd.read_parquet(f)
+            # 若 market 欄位不存在，用 market_tag 補填
+            if market_tag and ("market" not in df.columns or df["market"].isnull().all()):
+                df["market"] = market_tag
+            return df
+        except FileNotFoundError:
+            logger.debug(f"路徑不存在（跳過）：{path}")
+        except Exception as e:
+            logger.warning(f"讀取失敗 {path}：{e}")
+    return None
+
+
+# ════════════════════════════════════════════════════════
+# 正規化（型別 + 空值處理）
+# ════════════════════════════════════════════════════════
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """確保欄位存在且型別正確，空字串產業別填入「未分類」"""
+    """確保欄位存在且型別正確"""
     for col, dtype in _DTYPE_MAP.items():
         if col not in df.columns:
-            if dtype == "bool":
-                df[col] = False
-            elif dtype == "str":
-                df[col] = ""
-            else:
-                df[col] = 0.0
+            df[col] = False if dtype == "bool" else ("" if dtype == "str" else 0.0)
         else:
             try:
                 df[col] = df[col].astype(dtype)
             except Exception:
                 pass
 
-    # 空白 / NaN 產業別 → 「未分類」，讓下拉選單可以顯示
+    # 空白 / NaN 產業別 → 「未分類」
     if "industry" in df.columns:
         df["industry"] = df["industry"].fillna("未分類")
-        df.loc[df["industry"].str.strip() == "", "industry"] = "未分類"
+        df.loc[df["industry"].str.strip().isin(["", "nan", "None"]), "industry"] = "未分類"
 
     # 空白 name → 用 symbol 代替
     if "name" in df.columns and "symbol" in df.columns:
         mask = df["name"].fillna("").str.strip() == ""
         df.loc[mask, "name"] = df.loc[mask, "symbol"]
 
+    # market 大寫統一
+    if "market" in df.columns:
+        df["market"] = df["market"].str.upper().str.strip()
+
     return df
 
 
 # ════════════════════════════════════════════════════════
-# Mock 資料（開發用）
+# Mock 資料（開發用，USE_MOCK_DATA=true）
 # ════════════════════════════════════════════════════════
 
 _TW_INDUSTRIES = [
@@ -134,11 +197,11 @@ _TW_SYMBOLS = [
     ("4938", "和碩", "電子零組件"), ("2395", "研華", "電腦及週邊"),
     ("2337", "旺宏", "半導體"), ("2408", "南亞科", "半導體"),
     ("2353", "宏碁", "電腦及週邊"), ("6488", "環球晶", "半導體"),
-    ("3231", "緯創", "電腦及週邊"), ("5347", "世界", "半導體"),
+    ("3231", "緯創", "電腦及週邊"), ("5347", "世界先進", "半導體"),
     ("2357", "華碩", "電腦及週邊"), ("2376", "技嘉", "電腦及週邊"),
     ("3045", "台灣大", "通信網路"), ("4904", "遠傳", "通信網路"),
     ("2002", "中鋼", "鋼鐵"), ("2603", "長榮", "航運"),
-    ("2609", "陽明", "航運"), ("6523", "達運", "低軌衛星"),
+    ("2609", "陽明", "航運"), ("6523", "達運精密", "低軌衛星"),
     ("4916", "亞太電", "低軌衛星"), ("3673", "TPK-KY", "光電"),
     ("1301", "台塑", "塑膠"), ("1303", "南亞", "塑膠"),
     ("2886", "兆豐金", "金融保險"), ("2891", "中信金", "金融保險"),
@@ -164,59 +227,60 @@ def _mock_scan() -> pd.DataFrame:
     random.seed(42)
     rows = []
 
-    for symbol, name, industry in _TW_SYMBOLS + _US_SYMBOLS:
-        market = "TW" if len(symbol) == 4 and symbol.isdigit() or symbol.startswith("0") else "US"
-        # 也處理 ETF 代號
-        if symbol.startswith("0"):
-            market = "TW"
+    for symbol, name, industry in _TW_SYMBOLS:
+        rows.append(_make_mock_row(symbol, name, industry, "TW"))
 
-        close = random.uniform(50, 1200) if market == "TW" else random.uniform(10, 900)
-        ma50  = close * random.uniform(0.88, 1.08)
-        ma200 = ma50  * random.uniform(0.85, 1.10)
-        score = random.uniform(20, 95)
-        score_delta = random.uniform(-12, 12)
-        vol_ratio   = random.uniform(0.3, 4.5)
-        dist_52w    = random.uniform(-0.40, 0.02)
-        momentum_20d = random.uniform(-0.15, 0.20)
-
-        above_ma50   = close > ma50
-        above_ma200  = close > ma200
-        ma50_above   = ma50 > ma200
-
-        if above_ma50 and above_ma200 and ma50_above:
-            trend = "bull"
-        elif not above_ma50 and not above_ma200 and not ma50_above:
-            trend = "bear"
-        else:
-            trend = "mixed"
-
-        rows.append({
-            "symbol":             symbol,
-            "name":               name,
-            "market":             market,
-            "industry":           industry,
-            "date":               date.today(),
-            "close":              round(close, 2),
-            "volume":             round(random.uniform(1e5, 5e7)),
-            "avg_volume_20d":     round(random.uniform(5e5, 2e7)),
-            "ma50":               round(ma50, 2),
-            "ma200":              round(ma200, 2),
-            "score":              round(score, 1),
-            "score_delta":        round(score_delta, 1),
-            "vol_ratio_20d":      round(vol_ratio, 2),
-            "dist_to_52w_high":   round(dist_52w, 4),
-            "adj_close_to_ma50":  round(close / ma50 - 1, 4),
-            "adj_close_to_ma200": round(close / ma200 - 1, 4),
-            "momentum_20d":       round(momentum_20d, 4),
-            "trend_state":        trend,
-            "above_ma50":         above_ma50,
-            "above_ma200":        above_ma200,
-            "ma50_above_ma200":   ma50_above,
-            "near_52w_high":      dist_52w > -0.05,
-            "high_volume":        vol_ratio > 2.0,
-            "vcp_flag":           random.random() < 0.08,
-            "breakout_flag":      random.random() < 0.10,
-            "reversal_flag":      random.random() < 0.05,
-        })
+    for symbol, name, industry in _US_SYMBOLS:
+        rows.append(_make_mock_row(symbol, name, industry, "US"))
 
     return pd.DataFrame(rows)
+
+
+def _make_mock_row(symbol: str, name: str, industry: str, market: str) -> dict:
+    close = random.uniform(50, 1200) if market == "TW" else random.uniform(10, 900)
+    ma50  = close * random.uniform(0.88, 1.08)
+    ma200 = ma50  * random.uniform(0.85, 1.10)
+    score = random.uniform(20, 95)
+    score_delta = random.uniform(-12, 12)
+    vol_ratio   = random.uniform(0.3, 4.5)
+    dist_52w    = random.uniform(-0.40, 0.02)
+
+    above_ma50  = close > ma50
+    above_ma200 = close > ma200
+    ma50_above  = ma50 > ma200
+
+    if above_ma50 and above_ma200 and ma50_above:
+        trend = "bull"
+    elif not above_ma50 and not above_ma200 and not ma50_above:
+        trend = "bear"
+    else:
+        trend = "mixed"
+
+    return {
+        "symbol":             symbol,
+        "name":               name,
+        "market":             market,
+        "industry":           industry,
+        "date":               date.today(),
+        "close":              round(close, 2),
+        "volume":             round(random.uniform(1e5, 5e7)),
+        "avg_volume_20d":     round(random.uniform(5e5, 2e7)),
+        "ma50":               round(ma50, 2),
+        "ma200":              round(ma200, 2),
+        "score":              round(score, 1),
+        "score_delta":        round(score_delta, 1),
+        "vol_ratio_20d":      round(vol_ratio, 2),
+        "dist_to_52w_high":   round(dist_52w, 4),
+        "adj_close_to_ma50":  round(close / ma50 - 1, 4),
+        "adj_close_to_ma200": round(close / ma200 - 1, 4),
+        "momentum_20d":       round(random.uniform(-0.15, 0.20), 4),
+        "trend_state":        trend,
+        "above_ma50":         above_ma50,
+        "above_ma200":        above_ma200,
+        "ma50_above_ma200":   ma50_above,
+        "near_52w_high":      dist_52w > -0.05,
+        "high_volume":        vol_ratio > 2.0,
+        "vcp_flag":           random.random() < 0.08,
+        "breakout_flag":      random.random() < 0.10,
+        "reversal_flag":      random.random() < 0.05,
+    }
