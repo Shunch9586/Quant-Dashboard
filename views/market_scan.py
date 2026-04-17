@@ -225,25 +225,60 @@ def _render_data_controls() -> None:
         return
 
     from data.market_scan_fetcher import tw_scan_is_fresh
+    from data.us_scan_fetcher    import us_scan_is_fresh
 
-    col_tw, col_us, col_refresh = st.columns([3, 3, 2])
+    col_tw, col_us, col_tw_btn, col_us_btn = st.columns([3, 3, 1.5, 1.5])
 
     with col_tw:
         try:
-            is_fresh = tw_scan_is_fresh()   # 優先查 /tmp，不需 S3 權限
-            if is_fresh:
+            if tw_scan_is_fresh():
                 st.success("✅ **台股** 資料已是今日")
             else:
-                st.warning("⏳ **台股** 資料待更新，請點「更新台股」")
+                st.warning("⏳ **台股** 待更新")
         except Exception as e:
             st.error(f"❌ **台股** 狀態檢查失敗：{e}")
 
     with col_us:
-        st.info("ℹ️ **美股** 由 ETL pipeline 提供")
+        try:
+            if us_scan_is_fresh():
+                st.success("✅ **美股** 資料已是今日（全市場）")
+            else:
+                st.warning("⏳ **美股** 待更新（ETL ~3,000 支）")
+        except Exception as e:
+            st.error(f"❌ **美股** 狀態檢查失敗：{e}")
 
-    with col_refresh:
+    with col_tw_btn:
         if st.button("🔄 更新台股", key="scan_tw_refresh"):
             _do_tw_refresh()
+
+    with col_us_btn:
+        if st.button("🔄 更新美股", key="scan_us_refresh"):
+            _do_us_refresh()
+
+
+def _do_us_refresh() -> None:
+    """執行 US 全市場掃描更新（yfinance + Tiingo）"""
+    from data.us_scan_fetcher import run_us_scan
+
+    messages = []
+
+    with st.status("🌐 從 NASDAQ FTP + yfinance 更新美股全市場...", expanded=True) as status:
+        def _write(msg: str) -> None:
+            st.write(msg)
+            messages.append(msg)
+
+        try:
+            ok, msg = run_us_scan(fs=None, progress_cb=_write)
+        except Exception as e:
+            status.update(label=f"❌ 更新失敗：{e}", state="error")
+            return
+
+        if ok:
+            status.update(label=f"✅ {msg}", state="complete", expanded=False)
+            _cached_scan.clear()
+            st.rerun()
+        else:
+            status.update(label=f"❌ {msg}", state="error")
 
 
 def _do_tw_refresh() -> None:

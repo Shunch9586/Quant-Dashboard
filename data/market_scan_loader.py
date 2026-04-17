@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 
 BUCKET = config.S3_BUCKET_NAME
 
-# TW scan 本地快取（由 market_scan_fetcher 寫入，無需 S3 寫入權限）
+# 本地快取路徑（由各自的 fetcher 寫入，無需 S3 寫入權限）
 _TW_SCAN_LOCAL = Path(f"/tmp/tw_scan_{date.today().isoformat()}.parquet")
+_US_SCAN_LOCAL = Path(f"/tmp/us_scan_{date.today().isoformat()}.parquet")
 
 # ── S3 路徑定義 ─────────────────────────────────────────
 # 每個 market 各試兩個路徑；最後還有一個合併路徑兜底
@@ -112,11 +113,16 @@ def _load_from_s3() -> pd.DataFrame:
     if tw_df is not None:
         parts.append(tw_df)
 
-    # 2. 嘗試讀取 US 分開路徑
-    us_df = _try_paths(fs, _S3_PATHS_US, market_tag="US")
+    # 2. 嘗試讀取 US 資料（優先 /tmp 本地全市場快取，再 S3 ETL）
+    us_df = _try_local_us()
+    if us_df is not None:
+        logger.info(f"US 市場掃描載入（本地全市場快取）：{len(us_df)} 支")
+    else:
+        us_df = _try_paths(fs, _S3_PATHS_US, market_tag="US")
+        if us_df is not None:
+            logger.info(f"US 市場掃描載入（S3 ETL）：{len(us_df)} 支")
     if us_df is not None:
         parts.append(us_df)
-        logger.info(f"US 市場掃描載入：{len(us_df)} 支（ETL pre-filtered）")
 
     # 3. 若兩個分開路徑都找不到，嘗試合併路徑
     if not parts:
@@ -136,6 +142,19 @@ def _load_from_s3() -> pd.DataFrame:
     df = _normalize(df)
     logger.info(f"市場掃描合併完成：TW {len(df[df['market']=='TW'])} + US {len(df[df['market']=='US'])} = {len(df)} 支")
     return df
+
+
+def _try_local_us() -> Optional[pd.DataFrame]:
+    """嘗試從 /tmp 讀取今日 US scan（由 us_scan_fetcher 計算後存放）"""
+    if _US_SCAN_LOCAL.exists():
+        try:
+            df = pd.read_parquet(str(_US_SCAN_LOCAL))
+            if "market" not in df.columns or df["market"].isnull().all():
+                df["market"] = "US"
+            return df
+        except Exception as e:
+            logger.warning(f"讀取本地 US scan 失敗：{e}")
+    return None
 
 
 def _try_local_tw() -> Optional[pd.DataFrame]:
