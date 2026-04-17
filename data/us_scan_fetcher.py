@@ -256,15 +256,25 @@ def _try_tiingo_tickers() -> list[str]:
         # 正規化欄位名稱（防止大小寫差異）
         df.columns = [c.strip() for c in df.columns]
 
+        # endDate：Tiingo 對在架股票可能填 NaN / "" / "2100-01-01" 等未來日期
+        # 只排除已確定下市（過去日期）的股票
+        today_ts = pd.Timestamp.now().normalize()
+        end_dates = pd.to_datetime(df["endDate"], errors="coerce")
+        still_trading = end_dates.isna() | (end_dates > today_ts)
+
         mask = (
-            (df["assetType"] == "Stock") &                                  # 只要普通股
-            (df["priceCurrency"] == "USD") &                                # 美元計價
-            (df["exchange"].isin(MAJOR_US_EXCHANGES)) &                     # 主要美國交易所
-            (df["ticker"].str.match(r"^[A-Z]{1,5}$", na=False)) &          # 純英文 1-5 碼
-            (df["endDate"].isna() | (df["endDate"].astype(str) == ""))      # 在架（未下市）
+            (df["assetType"] == "Stock") &                          # 只要普通股
+            (df["priceCurrency"] == "USD") &                        # 美元計價
+            (df["exchange"].isin(MAJOR_US_EXCHANGES)) &             # 主要美國交易所
+            (df["ticker"].str.match(r"^[A-Z]{1,5}$", na=False)) &  # 純英文 1-5 碼
+            still_trading                                           # 未下市
         )
         syms = df[mask]["ticker"].dropna().unique().tolist()
-        logger.info(f"Tiingo ticker filter: {len(df)} total → {mask.sum()} passed")
+        logger.info(
+            f"Tiingo ticker filter: {len(df)} total → {mask.sum()} passed "
+            f"(exchange={df['exchange'].isin(MAJOR_US_EXCHANGES).sum()}, "
+            f"active={still_trading.sum()}, stock={( df['assetType']=='Stock').sum()})"
+        )
         return sorted(syms)
 
     except Exception as e:
@@ -333,30 +343,60 @@ def _try_nasdaq_ftp() -> list[str]:
 # ② 批次下載價格（yfinance）
 # ════════════════════════════════════════════════════════
 
-def _extract_ticker_df(raw: pd.DataFrame, sym: str, batch_len: int):
+def _extract_close_vol(
+    raw: pd.DataFrame,
+    sym: str,
+    batch_len: int,
+) -> tuple[Optional[pd.Series], Optional[pd.Series]]:
     """
-    從 yfinance 回傳的 DataFrame 中提取單一 ticker 的資料。
-    處理三種可能的格式：
-    - 單一 ticker：raw 本身就是 OHLCV DataFrame
-    - group_by='ticker'：MultiIndex (ticker, field)
-    - group_by='column'：MultiIndex (field, ticker)
+    從 yfinance 下載結果取出單一 ticker 的 Close / Volume Series。
+
+    yfinance 在不同版本 / 批量下可能回傳：
+      A. flat DataFrame（columns=[Open,High,Low,Close,Volume]）— 單 ticker 或批量中只剩 1 支
+      B. MultiIndex (field, ticker) — group_by="column"（預設）
+      C. MultiIndex (ticker, field) — group_by="ticker"
+    統一以「找到 Close + Volume 欄位」作為判斷依據。
     """
-    if batch_len == 1:
-        return raw.copy()
+    cols = raw.columns
 
-    if not isinstance(raw.columns, pd.MultiIndex):
-        return raw.copy()
+    # ── A. 無 MultiIndex（flat）──────────────────────────
+    if not isinstance(cols, pd.MultiIndex):
+        if batch_len == 1:
+            close = raw.get("Close") or raw.get("Adj Close")
+            vol   = raw.get("Volume")
+            return (close, vol) if close is not None else (None, None)
+        # 批量但回傳 flat → 只有 1 支有資料，但我們不知道是哪支
+        # 直接跳過，避免把同一份資料錯誤地賦給每支
+        return None, None
 
-    lvl0 = raw.columns.get_level_values(0).tolist()
-    lvl1 = raw.columns.get_level_values(1).tolist()
+    lvl0_set = set(cols.get_level_values(0))
 
-    if sym in lvl0:
-        # (ticker, field) → group_by='ticker'
-        return raw[sym].copy()
-    elif sym in lvl1:
-        # (field, ticker) → group_by='column'
-        return raw.xs(sym, axis=1, level=1).copy()
-    return None
+    # ── B. (field, ticker)：Close 在 level-0 ─────────────
+    if "Close" in lvl0_set:
+        close_frame = raw["Close"]   # DataFrame，columns = tickers
+        vol_frame   = raw.get("Volume")
+        if isinstance(close_frame, pd.Series):
+            # 整個 DataFrame 只有這 1 支
+            return (close_frame, vol_frame) if batch_len == 1 else (None, None)
+        close = close_frame.get(sym)
+        vol   = vol_frame.get(sym) if vol_frame is not None and isinstance(vol_frame, pd.DataFrame) else None
+        return close, vol
+
+    # ── C. (ticker, field)：ticker 在 level-0 ────────────
+    if sym in lvl0_set:
+        sym_df = raw[sym]
+        close  = sym_df.get("Close") or sym_df.get("Adj Close")
+        vol    = sym_df.get("Volume")
+        return close, vol
+
+    # ── D. 保底：掃描 level-1 是否有 ticker ──────────────
+    if sym in set(cols.get_level_values(1)):
+        sym_df = raw.xs(sym, axis=1, level=1)
+        close  = sym_df.get("Close") or sym_df.get("Adj Close")
+        vol    = sym_df.get("Volume")
+        return close, vol
+
+    return None, None
 
 
 def _batch_download(
@@ -366,6 +406,7 @@ def _batch_download(
     """
     用 yfinance 批次下載調整後收盤 + 成交量。
     每批 BATCH_SIZE 支，回傳 {symbol: price_df}。
+    使用 group_by="column"（field-first，最穩定跨版本）。
     """
     try:
         import yfinance as yf
@@ -377,13 +418,12 @@ def _batch_download(
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = symbols[batch_start : batch_start + BATCH_SIZE]
-        batch_str = " ".join(batch)
 
         try:
             raw = yf.download(
-                tickers=batch_str,
+                tickers=" ".join(batch),
                 period="14mo",
-                group_by="ticker",
+                group_by="column",   # field-first MultiIndex，跨版本最穩定
                 auto_adjust=True,
                 progress=False,
                 threads=True,
@@ -394,27 +434,29 @@ def _batch_download(
 
             for sym in batch:
                 try:
-                    ticker_df = _extract_ticker_df(raw, sym, len(batch))
-                    if ticker_df is None or len(ticker_df) < 50:
+                    close_s, vol_s = _extract_close_vol(raw, sym, len(batch))
+                    if close_s is None:
                         continue
 
-                    ticker_df = ticker_df.dropna(subset=["Close", "Volume"])
-                    ticker_df = ticker_df.rename(columns={"Close": "adj_close", "Volume": "volume"})
-                    ticker_df.index.name = "date"
-                    ticker_df = ticker_df.reset_index()[["date", "adj_close", "volume"]]
-                    ticker_df["adj_close"] = pd.to_numeric(ticker_df["adj_close"], errors="coerce")
-                    ticker_df["volume"]    = pd.to_numeric(ticker_df["volume"],    errors="coerce")
-                    ticker_df = ticker_df.dropna()
+                    close_s = pd.to_numeric(close_s, errors="coerce")
+                    vol_s   = pd.to_numeric(vol_s,   errors="coerce") if vol_s is not None else pd.Series(
+                        0.0, index=close_s.index
+                    )
 
-                    if len(ticker_df) < 50:
+                    df = pd.DataFrame({"adj_close": close_s, "volume": vol_s})
+                    df.index.name = "date"
+                    df = df.reset_index().dropna(subset=["adj_close"])
+                    df["volume"] = df["volume"].fillna(0.0)
+
+                    if len(df) < 50:
                         continue
 
-                    last_price = float(ticker_df["adj_close"].iloc[-1])
-                    avg_vol    = float(ticker_df["volume"].tail(20).mean())
+                    last_price = float(df["adj_close"].iloc[-1])
+                    avg_vol    = float(df["volume"].tail(20).mean())
                     if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
                         continue
 
-                    result[sym] = ticker_df
+                    result[sym] = df
 
                 except Exception:
                     continue
@@ -425,7 +467,7 @@ def _batch_download(
         done = min(batch_start + BATCH_SIZE, total)
         if done % (BATCH_SIZE * 5) == 0 or done >= total:
             progress_cb(
-                f"   下載進度：{done}/{total} 支 "
+                f"   下載進度：{done}/{total} 支"
                 f"（有效：{len(result)} 支）"
             )
 
