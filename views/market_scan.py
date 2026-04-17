@@ -71,7 +71,11 @@ def render() -> None:
                 "市場", ["全部", "TW", "US"], key="scan_market"
             )
         with row1_cols[1]:
-            industries = sorted(df["industry"].dropna().unique().tolist())
+            # 過濾空字串，確保選單清晰
+            industries = sorted([
+                i for i in df["industry"].dropna().unique().tolist()
+                if str(i).strip() not in ("", "nan")
+            ])
             industry_choice = st.multiselect(
                 "產業別", industries, key="scan_industry",
                 placeholder="全部產業"
@@ -148,10 +152,19 @@ def render() -> None:
     # ════════════════════════════════════════════════════════
     # 結果統計列
     # ════════════════════════════════════════════════════════
+    # 資料日期（若有 date 欄位）
+    data_date = ""
+    if "date" in df.columns and not df["date"].isnull().all():
+        try:
+            data_date = f"　｜　資料日期：{df['date'].max()}"
+        except Exception:
+            pass
+
     st.markdown(
         f"**找到 {len(filtered)} 支**（共 {len(df)} 支）"
         f"　TW: {len(filtered[filtered['market']=='TW'])} 支"
         f"　US: {len(filtered[filtered['market']=='US'])} 支"
+        f"{data_date}"
     )
 
     if filtered.empty:

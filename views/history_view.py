@@ -33,15 +33,20 @@ def render(record: DecisionRecord | None) -> None:
         st.info("← 選擇一個持倉查看歷史走勢")
         return
 
-    symbol      = record.symbol
-    market      = record.market
-    entry_price = record.entry_price
+    # 防禦性型別轉換（session_state 取出的值可能是 pandas/numpy 型別）
+    symbol      = str(record.symbol)
+    market      = str(record.market) if record.market else "TW"
+    entry_price = float(record.entry_price) if record.entry_price else 0.0
 
     # ── 載入歷史資料 ──────────────────────────────────────
     col_title, col_range = st.columns([3, 1])
     with col_title:
-        st.markdown(f"**{symbol}** 歷史走勢　<span style='color:#888;font-size:0.8em'>進場 ${entry_price:.2f}</span>",
-                    unsafe_allow_html=True)
+        price_label = f"進場 ${entry_price:.2f}" if entry_price > 0 else ""
+        st.markdown(
+            f"**{symbol}** 歷史走勢　"
+            f"<span style='color:#888;font-size:0.8em'>{price_label}</span>",
+            unsafe_allow_html=True,
+        )
     with col_range:
         days = st.selectbox("區間", [30, 60, 90, 120, 180], index=2, key="history_days")
 

@@ -85,7 +85,7 @@ def _load_from_s3() -> pd.DataFrame:
 
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """確保欄位存在且型別正確"""
+    """確保欄位存在且型別正確，空字串產業別填入「未分類」"""
     for col, dtype in _DTYPE_MAP.items():
         if col not in df.columns:
             if dtype == "bool":
@@ -99,6 +99,17 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = df[col].astype(dtype)
             except Exception:
                 pass
+
+    # 空白 / NaN 產業別 → 「未分類」，讓下拉選單可以顯示
+    if "industry" in df.columns:
+        df["industry"] = df["industry"].fillna("未分類")
+        df.loc[df["industry"].str.strip() == "", "industry"] = "未分類"
+
+    # 空白 name → 用 symbol 代替
+    if "name" in df.columns and "symbol" in df.columns:
+        mask = df["name"].fillna("").str.strip() == ""
+        df.loc[mask, "name"] = df.loc[mask, "symbol"]
+
     return df
 
 

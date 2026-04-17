@@ -150,7 +150,7 @@ def get_mock_portfolio_summary(records: list[DecisionRecord]) -> PortfolioSummar
 
 def get_mock_history(symbol: str, days: int = 120) -> list[HistoryPoint]:
     """產生某個 symbol 的模擬歷史資料（用於 Zone E）"""
-    random.seed(hash(symbol) % 999)
+    random.seed(hash(str(symbol) if symbol is not None else "") % 999)
     today = date.today()
     records = []
 
