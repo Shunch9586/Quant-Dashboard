@@ -1,8 +1,8 @@
 """
 市場掃描頁面
 全市場股票列表，支援多條件篩選與排序。
-TW 資料由 FinMind API 直接抓取（每日自動更新）。
-US 資料由 ETL pipeline 提供 + Tiingo 補充 industry。
+TW 資料由 tw_market.db（SQLite）計算。
+US 資料由 yfinance 全市場掃描 + Tiingo IEX 每日快速更新。
 """
 
 import streamlit as st
@@ -29,11 +29,12 @@ _SIGNAL_OPTIONS = {
 }
 
 _SORT_OPTIONS = {
-    "Score（高→低）":       ("score",           False),
-    "Score Delta（高→低）": ("score_delta",      False),
-    "爆量倍數（高→低）":    ("vol_ratio_20d",    False),
-    "距 52 週高（近→遠）":  ("dist_to_52w_high", False),
-    "代號（A→Z）":           ("symbol",           True),
+    "Score（高→低）":         ("score",             False),
+    "Score Delta（高→低）":   ("score_delta",        False),
+    "今日漲跌（高→低）":      ("daily_change_pct",   False),
+    "爆量倍數（高→低）":      ("vol_ratio_20d",      False),
+    "距 52 週高（近→遠）":    ("dist_to_52w_high",   False),
+    "代號（A→Z）":             ("symbol",             True),
 }
 
 
@@ -43,7 +44,6 @@ def _cached_scan() -> pd.DataFrame:
 
 
 def _get_fs():
-    """建立 s3fs FileSystem（供 fetcher 使用）"""
     import s3fs
     return s3fs.S3FileSystem(
         key=config.AWS_ACCESS_KEY_ID or None,
@@ -54,42 +54,36 @@ def _get_fs():
 def render() -> None:
     st.markdown("### 🔍 市場掃描")
 
-    # ── 頂部控制列：資料狀態 + 更新按鈕 ─────────────────────
+    # ── 頂部控制列 ────────────────────────────────────────
     _render_data_controls()
 
     df = _cached_scan()
 
-    # ── 尚無資料 ──────────────────────────────────────────
     if df.empty:
         st.info(
             "📭 尚無市場掃描資料。\n\n"
-            "- **台股**：點擊上方「🔄 更新台股」即可從 FinMind 抓取（需設定 FINMIND_API_TOKEN）\n"
-            "- **美股**：等待 ETL pipeline 輸出，或設定 TIINGO_API_KEY"
+            "- **台股**：點擊上方「🔄 更新台股」\n"
+            "- **美股**：點擊「🔄 全市場掃描」（首次約 2–3 分鐘），之後用「⚡ 快速更新」"
         )
         return
 
     # ════════════════════════════════════════════════════════
-    # 篩選列（三行排列，保持頁面不雜亂）
+    # 篩選列
     # ════════════════════════════════════════════════════════
     with st.expander("🎛️ 篩選條件", expanded=True):
         row1_cols = st.columns([2, 3, 2, 2])
         row2_cols = st.columns([3, 3, 2, 2])
         row3_cols = st.columns(5)
 
-        # Row 1
         with row1_cols[0]:
-            market_choice = st.selectbox(
-                "市場", ["全部", "TW", "US"], key="scan_market"
-            )
+            market_choice = st.selectbox("市場", ["全部", "TW", "US"], key="scan_market")
         with row1_cols[1]:
-            # 過濾空字串，確保選單清晰
             industries = sorted([
                 i for i in df["industry"].dropna().unique().tolist()
                 if str(i).strip() not in ("", "nan")
             ])
             industry_choice = st.multiselect(
-                "產業別", industries, key="scan_industry",
-                placeholder="全部產業"
+                "產業別", industries, key="scan_industry", placeholder="全部產業"
             )
         with row1_cols[2]:
             trend_choice = st.selectbox(
@@ -100,7 +94,6 @@ def render() -> None:
                 "排序方式", list(_SORT_OPTIONS.keys()), key="scan_sort"
             )
 
-        # Row 2
         with row2_cols[0]:
             score_min, score_max = st.slider(
                 "Score 範圍", 0, 100, (0, 100), step=5, key="scan_score"
@@ -114,7 +107,6 @@ def render() -> None:
         with row2_cols[3]:
             ma200_only = st.checkbox("MA50 > MA200", key="scan_ma200")
 
-        # Row 3：策略訊號 checkboxes
         signal_choices = []
         for i, (label, col_name) in enumerate(_SIGNAL_OPTIONS.items()):
             with row3_cols[i]:
@@ -149,21 +141,20 @@ def render() -> None:
 
     if ma50_only:
         filtered = filtered[filtered["above_ma50"] == True]
-
     if ma200_only:
         filtered = filtered[filtered["ma50_above_ma200"] == True]
-
     for sig_col in signal_choices:
         filtered = filtered[filtered[sig_col] == True]
 
-    # ── 排序 ──────────────────────────────────────────────
+    # ── 排序（daily_change_pct 可能不存在，容錯） ──────────
     sort_col, sort_asc = _SORT_OPTIONS[sort_choice]
+    if sort_col not in filtered.columns:
+        sort_col, sort_asc = "score", False
     filtered = filtered.sort_values(sort_col, ascending=sort_asc).reset_index(drop=True)
 
     # ════════════════════════════════════════════════════════
-    # 結果統計列
+    # 結果統計
     # ════════════════════════════════════════════════════════
-    # 資料日期（若有 date 欄位）
     data_date = ""
     if "date" in df.columns and not df["date"].isnull().all():
         try:
@@ -185,33 +176,46 @@ def render() -> None:
     # ════════════════════════════════════════════════════════
     # 顯示表格
     # ════════════════════════════════════════════════════════
-    display = _build_display(filtered)
+    has_daily = "daily_change_pct" in filtered.columns
+    display   = _build_display(filtered, has_daily=has_daily)
+
+    col_cfg = {
+        "symbol":      st.column_config.TextColumn("代號",   width=80),
+        "name":        st.column_config.TextColumn("名稱",   width=120),
+        "market":      st.column_config.TextColumn("市場",   width=60),
+        "industry":    st.column_config.TextColumn("產業別", width=120),
+        "close":       st.column_config.NumberColumn("收盤",  format="%.2f", width=80),
+        "score":       st.column_config.ProgressColumn(
+                           "Score", min_value=0, max_value=100, format="%.0f", width=100
+                       ),
+        "Δ Score":     st.column_config.NumberColumn("Δ Score",  format="%+.1f", width=80),
+        "trend":       st.column_config.TextColumn("狀態",   width=90),
+        "vol_x":       st.column_config.NumberColumn("量/均量", format="%.1fx", width=80),
+        "dist_52w":    st.column_config.NumberColumn("距高點", format="%.1f%%", width=80),
+        "signals":     st.column_config.TextColumn("訊號",   width=100),
+    }
+    if has_daily:
+        col_cfg["今日%"] = st.column_config.NumberColumn(
+            "今日%", format="%+.2f%%", width=75
+        )
+
     st.dataframe(
         display,
         use_container_width=True,
         height=520,
-        column_config={
-            "symbol":      st.column_config.TextColumn("代號", width=80),
-            "name":        st.column_config.TextColumn("名稱", width=120),
-            "market":      st.column_config.TextColumn("市場", width=60),
-            "industry":    st.column_config.TextColumn("產業別", width=120),
-            "close":       st.column_config.NumberColumn("收盤", format="%.2f", width=80),
-            "score":       st.column_config.ProgressColumn(
-                               "Score", min_value=0, max_value=100, format="%.0f", width=100
-                           ),
-            "Δ Score":     st.column_config.NumberColumn("Δ Score", format="%+.1f", width=80),
-            "trend":       st.column_config.TextColumn("狀態", width=90),
-            "vol_x":       st.column_config.NumberColumn("量/均量", format="%.1fx", width=80),
-            "dist_52w":    st.column_config.NumberColumn("距高點", format="%.1f%%", width=80),
-            "signals":     st.column_config.TextColumn("訊號", width=100),
-        },
+        column_config=col_cfg,
         hide_index=True,
     )
 
-    # ── 底部重新載入（清快取）────────────────────────────────
+    # ── 底部重新載入 ─────────────────────────────────────
     if st.button("🔄 重新載入（清快取）", key="scan_reload_bottom"):
         _cached_scan.clear()
         st.rerun()
+
+    # ════════════════════════════════════════════════════════
+    # 📰 個股新聞（Tiingo News API）
+    # ════════════════════════════════════════════════════════
+    _render_news_panel()
 
 
 # ════════════════════════════════════════════════════════
@@ -219,7 +223,6 @@ def render() -> None:
 # ════════════════════════════════════════════════════════
 
 def _render_data_controls() -> None:
-    """顯示 TW / US 資料狀態，以及手動更新按鈕"""
     if config.USE_MOCK_DATA:
         st.caption("🧪 Mock 模式：顯示假資料")
         return
@@ -227,52 +230,74 @@ def _render_data_controls() -> None:
     from data.market_scan_fetcher import tw_scan_is_fresh, get_tw_scan_date
     from data.us_scan_fetcher    import us_scan_is_fresh, get_us_scan_date
 
-    col_tw, col_us, col_tw_btn, col_us_btn = st.columns([3, 3, 1.5, 1.5])
-
+    # 第一列：狀態
+    col_tw, col_us = st.columns(2)
     with col_tw:
-        try:
-            scan_date = get_tw_scan_date()
-            date_hint = f"（{scan_date}）" if scan_date else ""
-            if tw_scan_is_fresh():
-                st.success(f"✅ **台股** 有效{date_hint}")
-            else:
-                st.warning("⏳ **台股** 待更新")
-        except Exception as e:
-            st.error(f"❌ **台股** 狀態檢查失敗：{e}")
+        scan_date = get_tw_scan_date()
+        hint = f"（{scan_date}）" if scan_date else ""
+        if tw_scan_is_fresh():
+            st.success(f"✅ **台股** 有效{hint}")
+        else:
+            st.warning("⏳ **台股** 待更新")
 
     with col_us:
-        try:
-            scan_date = get_us_scan_date()
-            date_hint = f"（{scan_date}）" if scan_date else ""
-            if us_scan_is_fresh():
-                st.success(f"✅ **美股** 有效{date_hint}（全市場）")
-            else:
-                st.warning("⏳ **美股** 待更新（ETL ~3,000 支）")
-        except Exception as e:
-            st.error(f"❌ **美股** 狀態檢查失敗：{e}")
+        scan_date = get_us_scan_date()
+        hint = f"（{scan_date}）" if scan_date else ""
+        if us_scan_is_fresh():
+            st.success(f"✅ **美股** 有效{hint}")
+        else:
+            st.warning("⏳ **美股** 待更新")
+
+    # 第二列：按鈕
+    col_tw_btn, col_us_fast, col_us_full = st.columns(3)
 
     with col_tw_btn:
-        if st.button("🔄 更新台股", key="scan_tw_refresh"):
+        if st.button("🔄 更新台股", key="scan_tw_refresh", use_container_width=True):
             _do_tw_refresh()
 
-    with col_us_btn:
-        if st.button("🔄 更新美股", key="scan_us_refresh"):
+    with col_us_fast:
+        help_txt = "用 Tiingo IEX 更新今日報價（< 30 秒），需先跑過全市場掃描"
+        if st.button("⚡ 快速更新今日報價", key="scan_us_fast",
+                     use_container_width=True, help=help_txt):
+            _do_us_daily_update()
+
+    with col_us_full:
+        help_txt = "yfinance 下載全市場 14 個月歷史並重算 Score（約 2–3 分鐘）"
+        if st.button("🔄 美股全市場掃描", key="scan_us_refresh",
+                     use_container_width=True, help=help_txt):
             _do_us_refresh()
 
 
+# ════════════════════════════════════════════════════════
+# 更新動作
+# ════════════════════════════════════════════════════════
+
+def _do_us_daily_update() -> None:
+    """IEX 批次快速更新今日報價（< 30 秒）"""
+    from data.us_scan_fetcher import run_us_daily_update
+
+    with st.status("⚡ Tiingo IEX 快速更新今日報價...", expanded=True) as status:
+        try:
+            ok, msg = run_us_daily_update(progress_cb=st.write)
+        except Exception as e:
+            status.update(label=f"❌ 更新失敗：{e}", state="error")
+            return
+
+        if ok:
+            status.update(label=f"✅ {msg}", state="complete", expanded=False)
+            _cached_scan.clear()
+            st.rerun()
+        else:
+            status.update(label=f"❌ {msg}", state="error")
+
+
 def _do_us_refresh() -> None:
-    """執行 US 全市場掃描更新（yfinance + Tiingo）"""
+    """yfinance 全市場掃描（2–3 分鐘）"""
     from data.us_scan_fetcher import run_us_scan
 
-    messages = []
-
-    with st.status("🌐 從 NASDAQ FTP + yfinance 更新美股全市場...", expanded=True) as status:
-        def _write(msg: str) -> None:
-            st.write(msg)
-            messages.append(msg)
-
+    with st.status("🌐 美股全市場掃描（yfinance + Tiingo）...", expanded=True) as status:
         try:
-            ok, msg = run_us_scan(fs=None, progress_cb=_write)
+            ok, msg = run_us_scan(fs=None, progress_cb=st.write)
         except Exception as e:
             status.update(label=f"❌ 更新失敗：{e}", state="error")
             return
@@ -286,18 +311,15 @@ def _do_us_refresh() -> None:
 
 
 def _do_tw_refresh() -> None:
-    """執行 TW 掃描更新，顯示進度"""
     from data.market_scan_fetcher import run_tw_scan
 
-    with st.status("🗄️ 從 tw_market.db 更新台股資料...", expanded=True) as status:
+    with st.status("🗄️ 從 tw_market.db 更新台股...", expanded=True) as status:
         st.write("⬇️ 確認 tw_market.db 快取（首次需下載 ~370MB）...")
-        st.write("📊 讀取全市場近 310 天價格資料...")
-        st.write("⚙️ 計算 MA50 / MA200 / Score（約 1,800 支股票）...")
+        st.write("📊 讀取全市場近 310 天價格...")
+        st.write("⚙️ 計算 MA / Score（約 1,800 支）...")
         st.write("💾 儲存至本地快取...")
-
         try:
-            fs      = _get_fs()
-            ok, msg = run_tw_scan(fs)
+            ok, msg = run_tw_scan(_get_fs())
         except Exception as e:
             status.update(label=f"❌ 更新失敗：{e}", state="error")
             return
@@ -311,11 +333,64 @@ def _do_tw_refresh() -> None:
 
 
 # ════════════════════════════════════════════════════════
+# 📰 個股新聞面板（Tiingo News API）
+# ════════════════════════════════════════════════════════
+
+def _render_news_panel() -> None:
+    """顯示個股最新新聞，由使用者輸入代號觸發"""
+    st.divider()
+    with st.expander("📰 個股新聞（Tiingo News API）", expanded=False):
+        api_key = config.fresh("TIINGO_API_KEY")
+        if not api_key:
+            st.info("請設定 TIINGO_API_KEY 以啟用新聞功能")
+            return
+
+        news_sym = st.text_input(
+            "輸入代號查詢新聞",
+            placeholder="例如：NVDA 或 AAPL",
+            key="scan_news_sym",
+        ).strip().upper()
+
+        if not news_sym:
+            st.caption("輸入股票代號後顯示最新 8 則新聞")
+            return
+
+        with st.spinner(f"載入 {news_sym} 新聞..."):
+            from data.tiingo_utils import fetch_stock_news
+            articles = fetch_stock_news([news_sym], api_key, limit=8)
+
+        if not articles:
+            st.warning(f"找不到 {news_sym} 的相關新聞，請確認代號是否正確")
+            return
+
+        for art in articles:
+            pub_date = str(art.get("publishedDate", ""))[:10]
+            title    = art.get("title", "（無標題）")
+            source   = art.get("source", "")
+            url      = art.get("url", "")
+            tickers  = ", ".join(art.get("tickers", []))
+
+            col_date, col_body = st.columns([1, 6])
+            with col_date:
+                st.caption(pub_date)
+                if source:
+                    st.caption(f"_{source}_")
+            with col_body:
+                if url:
+                    st.markdown(f"**[{title}]({url})**")
+                else:
+                    st.markdown(f"**{title}**")
+                if tickers:
+                    st.caption(f"相關：{tickers}")
+
+            st.divider()
+
+
+# ════════════════════════════════════════════════════════
 # 輔助：建立顯示用 DataFrame
 # ════════════════════════════════════════════════════════
 
-def _build_display(df: pd.DataFrame) -> pd.DataFrame:
-    """從原始 DataFrame 建立適合顯示的精簡版本"""
+def _build_display(df: pd.DataFrame, has_daily: bool = False) -> pd.DataFrame:
 
     def trend_badge(t):
         return {"bull": "🟢 多頭", "bear": "🔴 空頭", "mixed": "🟡 混合"}.get(t, t)
@@ -339,7 +414,11 @@ def _build_display(df: pd.DataFrame) -> pd.DataFrame:
         "Δ Score":  df["score_delta"],
         "trend":    df["trend_state"].apply(trend_badge),
         "vol_x":    df["vol_ratio_20d"],
-        "dist_52w": df["dist_to_52w_high"] * 100,   # 轉成百分比
+        "dist_52w": df["dist_to_52w_high"] * 100,
         "signals":  df.apply(signal_badges, axis=1),
     })
+
+    if has_daily:
+        out["今日%"] = df["daily_change_pct"]
+
     return out

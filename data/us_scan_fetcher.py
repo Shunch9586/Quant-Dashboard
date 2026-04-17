@@ -73,6 +73,76 @@ def get_us_scan_date() -> Optional[str]:
     return None
 
 
+def run_us_daily_update(progress_cb: Optional[Callable] = None) -> tuple[bool, str]:
+    """
+    快速每日更新：用 Tiingo IEX 批次取最新報價，更新 close / daily_change。
+    前提：US_SCAN_LOCAL 已存在（全市場掃描跑過至少一次）。
+    通常 < 30 秒，不需重跑 yfinance。
+    """
+    def _p(msg: str) -> None:
+        logger.info(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    if not US_SCAN_LOCAL.exists():
+        return False, "尚無完整掃描資料，請先執行「全市場掃描」"
+
+    api_key = config.fresh("TIINGO_API_KEY")
+    if not api_key:
+        return False, "TIINGO_API_KEY 未設定"
+
+    try:
+        _p("📂 載入現有掃描資料...")
+        scan_df = pd.read_parquet(str(US_SCAN_LOCAL))
+        symbols = scan_df["symbol"].tolist()
+        n_batches = (len(symbols) + 499) // 500
+        _p(f"   {len(symbols)} 支（{n_batches} 個 IEX 請求）")
+
+        _p("⚡ Tiingo IEX 批次取最新報價...")
+        from data.tiingo_utils import iex_batch_prices
+        prices = iex_batch_prices(symbols, api_key)
+        _p(f"   取得 {len(prices)} 支最新報價")
+
+        if not prices:
+            return False, "IEX 回傳空資料，請確認 TIINGO_API_KEY 與 Power plan 狀態"
+
+        # 更新 close / daily_change / date
+        _p("🔄 更新報價與漲跌幅...")
+        updated = 0
+        daily_changes = []
+
+        for idx in range(len(scan_df)):
+            sym  = scan_df.at[idx, "symbol"]
+            info = prices.get(sym)
+            if info is None:
+                daily_changes.append(None)
+                continue
+
+            new_price  = info["lastPrice"]
+            prev_close = info.get("prevClose") or float(scan_df.at[idx, "close"])
+            daily_chg  = (new_price - prev_close) / prev_close if prev_close > 0 else 0.0
+
+            scan_df.at[idx, "close"] = round(new_price, 2)
+            scan_df.at[idx, "date"]  = date.today()
+            if info.get("volume"):
+                scan_df.at[idx, "volume"] = info["volume"]
+
+            daily_changes.append(round(daily_chg * 100, 2))   # 轉為 %
+            updated += 1
+
+        scan_df["daily_change_pct"] = daily_changes
+
+        scan_df.to_parquet(str(US_SCAN_LOCAL), index=False, engine="pyarrow")
+        US_SCAN_DATE_FILE.write_text(date.today().isoformat())
+        _p(f"💾 更新完成（{updated} 支有新報價）")
+
+        return True, f"今日報價更新完成：{updated}/{len(symbols)} 支"
+
+    except Exception as e:
+        logger.exception("US daily update 失敗")
+        return False, f"發生錯誤：{e}"
+
+
 def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, str]:
     """
     執行 US 全市場掃描，結果存至 /tmp/us_scan_{today}.parquet。
