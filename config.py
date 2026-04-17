@@ -35,6 +35,7 @@ USE_MOCK_DATA = _get("USE_MOCK_DATA", "true").lower() == "true"
 DRAWDOWN_ALERT_THRESHOLD = float(_get("DRAWDOWN_ALERT_THRESHOLD", "-0.15"))
 LIVE_PRICE_CACHE_TTL     = int(_get("LIVE_PRICE_CACHE_TTL", "300"))
 
-# ── 即時報價 API（選配）──────────────────────────────────
-TIINGO_API_KEY  = _get("TIINGO_API_KEY")
-FINMIND_API_KEY = _get("FINMIND_API_KEY")
+# ── 外部 API ─────────────────────────────────────────────
+TIINGO_API_KEY     = _get("TIINGO_API_KEY")
+# FinMind 支援兩種 key 名稱（向後相容）
+FINMIND_API_TOKEN  = _get("FINMIND_API_TOKEN") or _get("FINMIND_API_KEY")

@@ -1,14 +1,16 @@
 """
 市場掃描資料載入器
-支援 TW / US 分開儲存，自動嘗試多個 S3 路徑後合併。
 
-━━ S3 路徑優先順序（每個 market 各自嘗試）━━
-  1. data_lake/market_scan/market={TW|US}/latest/scan.parquet  ← 分開存（優先）
-  2. data_lake/market_scan/market={TW|US}/scan.parquet         ← 無 latest 子目錄
-  3. data_lake/market_scan/latest/scan.parquet                 ← 合併存（fallback）
+TW：由 market_scan_fetcher.py 呼叫 FinMind API 產生，存於 S3
+US：由 ETL pipeline 產生，存於 S3（約 3,000 支 pre-filtered）
 
-TW 約 1,800 支（全量）
-US 約 3,000 支（ETL pre-filtered，非全市場 20,000+，這是設計行為）
+S3 路徑嘗試順序（每個 market 各自）：
+  1. data_lake/market_scan/market=TW|US/latest/scan.parquet  ← 主路徑
+  2. data_lake/market_scan/market=TW|US/scan.parquet         ← 備用
+  3. data_lake/market_scan/latest/scan.parquet               ← ETL 合併 fallback
+
+US industry 由 Tiingo API 補充，快取於：
+  data_lake/market_scan/us_industry_cache.parquet
 """
 
 import logging

@@ -1,12 +1,14 @@
 """
 市場掃描頁面
 全市場股票列表，支援多條件篩選與排序。
-資料來自 ETL pipeline 每日產出的 scan.parquet（S3）。
+TW 資料由 FinMind API 直接抓取（每日自動更新）。
+US 資料由 ETL pipeline 提供 + Tiingo 補充 industry。
 """
 
 import streamlit as st
 import pandas as pd
 
+import config
 from data.market_scan_loader import load_market_scan
 
 
@@ -40,21 +42,30 @@ def _cached_scan() -> pd.DataFrame:
     return load_market_scan()
 
 
+def _get_fs():
+    """建立 s3fs FileSystem（供 fetcher 使用）"""
+    import s3fs
+    return s3fs.S3FileSystem(
+        key=config.AWS_ACCESS_KEY_ID or None,
+        secret=config.AWS_SECRET_ACCESS_KEY or None,
+    )
+
+
 def render() -> None:
     st.markdown("### 🔍 市場掃描")
 
+    # ── 頂部控制列：資料狀態 + 更新按鈕 ─────────────────────
+    _render_data_controls()
+
     df = _cached_scan()
 
-    # ── 尚無資料（ETL 尚未產出）────────────────────────────
+    # ── 尚無資料 ──────────────────────────────────────────
     if df.empty:
         st.info(
             "📭 尚無市場掃描資料。\n\n"
-            "請先執行 ETL pipeline 的 `full_market_scan.py`，\n"
-            "確認 S3 路徑 `data_lake/market_scan/latest/scan.parquet` 存在後重新載入。"
+            "- **台股**：點擊上方「🔄 更新台股」即可從 FinMind 抓取（需設定 FINMIND_API_TOKEN）\n"
+            "- **美股**：等待 ETL pipeline 輸出，或設定 TIINGO_API_KEY"
         )
-        if st.button("🔄 重新載入", key="scan_reload"):
-            _cached_scan.clear()
-            st.rerun()
         return
 
     # ════════════════════════════════════════════════════════
@@ -197,10 +208,75 @@ def render() -> None:
         hide_index=True,
     )
 
-    # ── 底部重新載入按鈕 ──────────────────────────────────
-    if st.button("🔄 重新載入掃描資料", key="scan_reload_bottom"):
+    # ── 底部重新載入（清快取）────────────────────────────────
+    if st.button("🔄 重新載入（清快取）", key="scan_reload_bottom"):
         _cached_scan.clear()
         st.rerun()
+
+
+# ════════════════════════════════════════════════════════
+# 資料控制列（頂部）
+# ════════════════════════════════════════════════════════
+
+def _render_data_controls() -> None:
+    """顯示 TW / US 資料狀態，以及手動更新按鈕"""
+    if config.USE_MOCK_DATA:
+        st.caption("🧪 Mock 模式：顯示假資料")
+        return
+
+    from data.market_scan_fetcher import tw_scan_is_fresh
+
+    col_tw, col_us, col_refresh = st.columns([3, 3, 2])
+
+    # TW 狀態
+    with col_tw:
+        has_token = bool(config.FINMIND_API_TOKEN)
+        if not has_token:
+            st.warning("⚠️ **台股**：未設定 FINMIND_API_TOKEN")
+        else:
+            try:
+                fs = _get_fs()
+                fresh = tw_scan_is_fresh(fs)
+                if fresh:
+                    st.success("✅ **台股** 資料已是今日")
+                else:
+                    st.warning("⏳ **台股** 資料待更新")
+            except Exception:
+                st.error("❌ **台股** 無法檢查 S3")
+
+    # US 狀態（由 ETL 提供，簡單顯示）
+    with col_us:
+        st.info("ℹ️ **美股** 由 ETL pipeline 提供")
+
+    # 更新按鈕
+    with col_refresh:
+        if st.button("🔄 更新台股", key="scan_tw_refresh",
+                     disabled=not bool(config.FINMIND_API_TOKEN)):
+            _do_tw_refresh()
+
+
+def _do_tw_refresh() -> None:
+    """執行 TW 掃描更新，顯示進度"""
+    from data.market_scan_fetcher import run_tw_scan
+
+    with st.status("📡 從 FinMind 更新台股資料...", expanded=True) as status:
+        st.write("🔍 抓取股票清單（TaiwanStockInfo）...")
+        st.write("📈 抓取近 300 天調整後收盤（TaiwanStockPriceAdj）...")
+        st.write("⚙️ 計算 MA50 / MA200 / Score 等技術指標...")
+
+        try:
+            fs      = _get_fs()
+            ok, msg = run_tw_scan(fs)
+        except Exception as e:
+            status.update(label=f"❌ 更新失敗：{e}", state="error")
+            return
+
+        if ok:
+            status.update(label=f"✅ {msg}", state="complete", expanded=False)
+            _cached_scan.clear()
+            st.rerun()
+        else:
+            status.update(label=f"❌ {msg}", state="error")
 
 
 # ════════════════════════════════════════════════════════
