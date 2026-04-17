@@ -40,6 +40,8 @@ st.markdown("""
 # ── Session State：記住目前選中的 symbol ──────────────────
 if "selected_symbol" not in st.session_state:
     st.session_state.selected_symbol = None
+if "selected_record" not in st.session_state:
+    st.session_state.selected_record = None
 
 
 # ── 載入資料 ──────────────────────────────────────────────
@@ -86,6 +88,7 @@ with tab_portfolio:
         clicked_from_alert = alert_queue.render(records)
         if clicked_from_alert:
             st.session_state.selected_symbol = clicked_from_alert
+            st.session_state.selected_record = next((r for r in records if r.symbol == clicked_from_alert), None)
 
     with zone_c:
         selected = st.session_state.selected_symbol
@@ -101,9 +104,10 @@ with tab_portfolio:
         clicked_from_health = technical_health.render(records)
         if clicked_from_health:
             st.session_state.selected_symbol = clicked_from_health
+            st.session_state.selected_record = next((r for r in records if r.symbol == clicked_from_health), None)
 
     with zone_e:
-        history_view.render(st.session_state.selected_symbol)
+        history_view.render(st.session_state.selected_record)
 
 with tab_scan:
     market_scan.render()

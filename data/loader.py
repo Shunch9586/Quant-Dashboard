@@ -63,10 +63,11 @@ def load_portfolio_summary(records: list[DecisionRecord]) -> PortfolioSummaryDat
     return mock_data.get_mock_portfolio_summary(records)
 
 
-def load_history(symbol: str, market: str = "TW", days: int = 120) -> list[HistoryPoint]:
+def load_history(symbol: str, market: str = "TW", days: int = 120,
+                 entry_price: float = 0.0) -> list[HistoryPoint]:
     if config.USE_MOCK_DATA:
         return mock_data.get_mock_history(symbol, days)
-    return _load_history_real(symbol, market, days)
+    return _load_history_real(symbol, market, days, entry_price)
 
 
 # ════════════════════════════════════════════════════════
@@ -164,7 +165,8 @@ def _load_positions_real() -> list[DecisionRecord]:
     return records
 
 
-def _load_history_real(symbol: str, market: str, days: int) -> list[HistoryPoint]:
+def _load_history_real(symbol: str, market: str, days: int,
+                       entry_price: float = 0.0) -> list[HistoryPoint]:
     """載入某個 symbol 的歷史時間序列"""
     _ensure_tw_db()
 
@@ -184,10 +186,13 @@ def _load_history_real(symbol: str, market: str, days: int) -> list[HistoryPoint
 
     result = []
     for _, row in df.iterrows():
+        curr_price = float(row["adj_close"])
+        # 用進場價計算當日 ROI（進場價未知時顯示 0）
+        roi = (curr_price - entry_price) / entry_price if entry_price > 0 else 0.0
         result.append(HistoryPoint(
             date=_parse_date(str(row["date"])),
-            roi=0.0,             # 將在 view 層根據 entry_price 計算
-            curr_price=float(row["adj_close"]),
+            roi=round(roi, 4),
+            curr_price=curr_price,
             score=float(row.get("score", 50.0)),
             score_delta=float(row.get("score_delta", 0.0)),
             should_exit=False,   # 歷史 Decision 紀錄尚未建立

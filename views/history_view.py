@@ -7,7 +7,7 @@ Zone E — HistoryView
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from data.models import HistoryPoint
+from data.models import DecisionRecord, HistoryPoint
 from data.loader import load_history
 
 
@@ -26,21 +26,26 @@ def _chart_config() -> dict:
     }
 
 
-def render(symbol: str | None) -> None:
+def render(record: DecisionRecord | None) -> None:
     st.markdown("### 📜 History")
 
-    if symbol is None:
+    if record is None:
         st.info("← 選擇一個持倉查看歷史走勢")
         return
+
+    symbol      = record.symbol
+    market      = record.market
+    entry_price = record.entry_price
 
     # ── 載入歷史資料 ──────────────────────────────────────
     col_title, col_range = st.columns([3, 1])
     with col_title:
-        st.markdown(f"**{symbol}** 歷史走勢")
+        st.markdown(f"**{symbol}** 歷史走勢　<span style='color:#888;font-size:0.8em'>進場 ${entry_price:.2f}</span>",
+                    unsafe_allow_html=True)
     with col_range:
         days = st.selectbox("區間", [30, 60, 90, 120, 180], index=2, key="history_days")
 
-    history = load_history(symbol, days)
+    history = load_history(symbol, market, days, entry_price)
 
     if not history:
         st.warning(f"找不到 {symbol} 的歷史資料")
