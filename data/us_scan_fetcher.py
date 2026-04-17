@@ -40,9 +40,12 @@ OTHER_LISTED_URL   = "https://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.t
 
 BATCH_SIZE        = 200      # yfinance 每批張數
 MAX_SYMBOLS       = 7000     # 上限（避免記憶體不足）
-MIN_PRICE         = 2.0      # 過濾低價垃圾股
-MIN_AVG_VOLUME    = 100_000  # 過濾低流動性
-MAX_IND_FETCH     = 800      # Tiingo 每次最多補充多少産業資訊
+MIN_PRICE         = 1.0      # 過濾低價（放寬至 $1，避免誤殺正常股）
+MIN_AVG_VOLUME    = 50_000   # 過濾低流動性（放寬至 5 萬，涵蓋中小型股）
+MAX_IND_FETCH     = 2000     # Tiingo 每次最多補充多少産業資訊
+
+# yfinance 抓取品質最佳的主要美國交易所
+MAJOR_US_EXCHANGES = {"NASDAQ", "NYSE", "NYSE MKT", "AMEX", "NYSE ARCA"}
 
 
 # ════════════════════════════════════════════════════════
@@ -179,7 +182,7 @@ def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, 
 
         # ④ 補充産業資訊
         _p("🏷️  補充産業分類（Tiingo，優先高分股）...")
-        scan_df = _enrich_industry(scan_df, max_fetch=MAX_IND_FETCH)
+        scan_df = _enrich_industry(scan_df, max_fetch=MAX_IND_FETCH, progress_cb=_p)
 
         # ⑤ 儲存（固定路徑 + 日期記錄）
         scan_df.to_parquet(str(US_SCAN_LOCAL), index=False, engine="pyarrow")
@@ -199,35 +202,44 @@ def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, 
 
 def _get_us_symbols() -> list[str]:
     """
-    取得全市場股票清單，依序嘗試三個來源：
-    1. Tiingo supported_tickers.zip（最完整，免費公開 ZIP）
-    2. SEC EDGAR company_tickers.json（備用，約 1 萬家上市公司）
-    3. NASDAQ FTP（第三選擇，Streamlit Cloud 可能被封鎖）
-    過濾：排除 ETF，只保留 1–5 個大寫英文字母的純股票代號
+    取得全市場股票清單（只取主要美國交易所，確保 yfinance 覆蓋率接近 100%）。
+    依序嘗試三個來源，若 Tiingo < 3000 支則補充 SEC EDGAR。
     """
-    symbols = _try_tiingo_tickers()
-    if symbols:
-        logger.info(f"股票清單來源：Tiingo supported_tickers（{len(symbols)} 支）")
-        return symbols
+    symbols: set[str] = set()
 
-    symbols = _try_sec_tickers()
-    if symbols:
-        logger.info(f"股票清單來源：SEC EDGAR（{len(symbols)} 支）")
-        return symbols
+    # 1. Tiingo ZIP（最乾淨，有 exchange + endDate 可過濾）
+    tiingo = _try_tiingo_tickers()
+    symbols.update(tiingo)
+    logger.info(f"Tiingo 貢獻：{len(tiingo)} 支")
 
-    symbols = _try_nasdaq_ftp()
-    if symbols:
-        logger.info(f"股票清單來源：NASDAQ FTP（{len(symbols)} 支）")
-        return symbols
+    # 若 Tiingo 不足，補充 SEC EDGAR
+    if len(symbols) < 3000:
+        sec = _try_sec_tickers()
+        before = len(symbols)
+        symbols.update(sec)
+        logger.info(f"SEC EDGAR 補充：{len(symbols) - before} 支")
 
-    logger.error("三個股票清單來源均失敗")
-    return []
+    # 若還是不足，再嘗試 NASDAQ FTP
+    if len(symbols) < 3000:
+        ftp = _try_nasdaq_ftp()
+        before = len(symbols)
+        symbols.update(ftp)
+        logger.info(f"NASDAQ FTP 補充：{len(symbols) - before} 支")
+
+    if not symbols:
+        logger.error("所有股票清單來源均失敗")
+        return []
+
+    result = sorted(symbols)[:MAX_SYMBOLS]
+    logger.info(f"最終股票清單：{len(result)} 支")
+    return result
 
 
 def _try_tiingo_tickers() -> list[str]:
     """
-    Tiingo supported_tickers.zip：免費公開 ZIP，包含所有 Tiingo 支援的代號。
-    CSV 欄位：ticker, exchange, assetType, priceCurrency, startDate, endDate
+    Tiingo supported_tickers.zip。
+    只取主要美國交易所 + 在架（無 endDate）的普通股，
+    確保 yfinance 對這批股票有近 100% 覆蓋率。
     """
     import zipfile
     import io as _io
@@ -241,16 +253,19 @@ def _try_tiingo_tickers() -> list[str]:
             with zf.open(csv_name) as f:
                 df = pd.read_csv(f)
 
-        # 過濾：只要 Stock（非 ETF / Mutual Fund），且主要交易所
-        valid_exchanges = {"NYSE", "NASDAQ", "NYSE MKT", "NYSE ARCA", "BATS", "IEX"}
+        # 正規化欄位名稱（防止大小寫差異）
+        df.columns = [c.strip() for c in df.columns]
+
         mask = (
-            (df["assetType"].str.upper().isin(["STOCK", "COMMON STOCK"])) &
-            (df["exchange"].str.upper().isin({e.upper() for e in valid_exchanges})) &
-            (df["ticker"].str.match(r"^[A-Z]{1,5}$", na=False)) &
-            (df["priceCurrency"].str.upper() == "USD")
+            (df["assetType"] == "Stock") &                                  # 只要普通股
+            (df["priceCurrency"] == "USD") &                                # 美元計價
+            (df["exchange"].isin(MAJOR_US_EXCHANGES)) &                     # 主要美國交易所
+            (df["ticker"].str.match(r"^[A-Z]{1,5}$", na=False)) &          # 純英文 1-5 碼
+            (df["endDate"].isna() | (df["endDate"].astype(str) == ""))      # 在架（未下市）
         )
         syms = df[mask]["ticker"].dropna().unique().tolist()
-        return sorted(syms)[:MAX_SYMBOLS]
+        logger.info(f"Tiingo ticker filter: {len(df)} total → {mask.sum()} passed")
+        return sorted(syms)
 
     except Exception as e:
         logger.warning(f"Tiingo supported_tickers 失敗：{e}")
@@ -318,6 +333,32 @@ def _try_nasdaq_ftp() -> list[str]:
 # ② 批次下載價格（yfinance）
 # ════════════════════════════════════════════════════════
 
+def _extract_ticker_df(raw: pd.DataFrame, sym: str, batch_len: int):
+    """
+    從 yfinance 回傳的 DataFrame 中提取單一 ticker 的資料。
+    處理三種可能的格式：
+    - 單一 ticker：raw 本身就是 OHLCV DataFrame
+    - group_by='ticker'：MultiIndex (ticker, field)
+    - group_by='column'：MultiIndex (field, ticker)
+    """
+    if batch_len == 1:
+        return raw.copy()
+
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return raw.copy()
+
+    lvl0 = raw.columns.get_level_values(0).tolist()
+    lvl1 = raw.columns.get_level_values(1).tolist()
+
+    if sym in lvl0:
+        # (ticker, field) → group_by='ticker'
+        return raw[sym].copy()
+    elif sym in lvl1:
+        # (field, ticker) → group_by='column'
+        return raw.xs(sym, axis=1, level=1).copy()
+    return None
+
+
 def _batch_download(
     symbols: list[str],
     progress_cb: Callable,
@@ -353,28 +394,21 @@ def _batch_download(
 
             for sym in batch:
                 try:
-                    # yfinance 多 ticker 回傳 MultiIndex (field, ticker)
-                    if len(batch) == 1:
-                        ticker_df = raw.copy()
-                    elif sym in raw.columns.get_level_values(0):
-                        ticker_df = raw[sym].copy()
-                    else:
-                        continue
-
-                    if ticker_df.empty or len(ticker_df) < 50:
+                    ticker_df = _extract_ticker_df(raw, sym, len(batch))
+                    if ticker_df is None or len(ticker_df) < 50:
                         continue
 
                     ticker_df = ticker_df.dropna(subset=["Close", "Volume"])
-                    ticker_df = ticker_df.rename(columns={
-                        "Close":  "adj_close",
-                        "Volume": "volume",
-                    })
+                    ticker_df = ticker_df.rename(columns={"Close": "adj_close", "Volume": "volume"})
                     ticker_df.index.name = "date"
                     ticker_df = ticker_df.reset_index()[["date", "adj_close", "volume"]]
-                    ticker_df["adj_close"] = ticker_df["adj_close"].astype(float)
-                    ticker_df["volume"]    = ticker_df["volume"].astype(float)
+                    ticker_df["adj_close"] = pd.to_numeric(ticker_df["adj_close"], errors="coerce")
+                    ticker_df["volume"]    = pd.to_numeric(ticker_df["volume"],    errors="coerce")
+                    ticker_df = ticker_df.dropna()
 
-                    # 過濾低價 / 低量
+                    if len(ticker_df) < 50:
+                        continue
+
                     last_price = float(ticker_df["adj_close"].iloc[-1])
                     avg_vol    = float(ticker_df["volume"].tail(20).mean())
                     if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
@@ -482,96 +516,114 @@ def _compute_scan(
 # ④ 産業分類（Tiingo，本地快取）
 # ════════════════════════════════════════════════════════
 
-def _enrich_industry(scan_df: pd.DataFrame, max_fetch: int = MAX_IND_FETCH) -> pd.DataFrame:
+def _enrich_industry(
+    scan_df: pd.DataFrame,
+    max_fetch: int = MAX_IND_FETCH,
+    progress_cb: Optional[Callable] = None,
+) -> pd.DataFrame:
     """
-    用 Tiingo 補充名稱 + 産業分類（限制 API 呼叫）。
-    優先補充 score 最高的股票。
-    快取儲存於 /tmp/us_industry_cache.parquet（跨次呼叫復用）。
+    用 Tiingo metadata 補充名稱 + 産業分類。
+    - 優先從本地快取讀取（跨次復用）
+    - 對無資料的股票逐一呼叫 Tiingo /tiingo/daily/{ticker}
+    - 用 DataFrame.loc 直接更新（保留欄位型別，避免 apply 型別污染）
+    - sector 作為 industry 的 fallback（Tiingo industry 欄位常為 null）
     """
     api_key = config.fresh("TIINGO_API_KEY")
     if not api_key:
+        logger.warning("TIINGO_API_KEY 未設定，跳過産業補充")
         return scan_df
 
-    # 載入本地 industry 快取
+    def _p(msg: str) -> None:
+        logger.info(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    # ── 載入本地快取 ──────────────────────────────────────
     cache_map: dict[str, dict] = {}
     if US_IND_CACHE.exists():
         try:
             cached = pd.read_parquet(str(US_IND_CACHE))
-            for _, row in cached.iterrows():
-                cache_map[str(row["symbol"])] = {
-                    "name":     str(row.get("name", "")),
-                    "industry": str(row.get("industry", "未分類")),
+            for _, r in cached.iterrows():
+                cache_map[str(r["symbol"])] = {
+                    "name":     str(r.get("name", "") or ""),
+                    "industry": str(r.get("industry", "") or ""),
+                    "sector":   str(r.get("sector", "") or ""),
                 }
-        except Exception:
-            pass
+            _p(f"   産業快取載入：{len(cache_map)} 支")
+        except Exception as e:
+            logger.warning(f"産業快取讀取失敗：{e}")
 
-    # 套用已有快取
-    def _apply(row: pd.Series) -> pd.Series:
-        info = cache_map.get(row["symbol"])
-        if info:
-            if info.get("name"):
-                row["name"] = info["name"]
-            if info.get("industry") and info["industry"] not in ("", "nan", "None", "未分類"):
-                row["industry"] = info["industry"]
-        return row
+    # ── 套用快取（直接 loc 更新，保留型別） ──────────────
+    scan_df = scan_df.copy()
+    scan_df["sector"] = ""    # 確保 sector 欄存在
 
-    scan_df = scan_df.apply(_apply, axis=1)
+    for idx in range(len(scan_df)):
+        sym  = scan_df.at[idx, "symbol"]
+        info = cache_map.get(sym)
+        if not info:
+            continue
+        if info.get("name"):
+            scan_df.at[idx, "name"] = info["name"]
+        ind = info.get("industry") or info.get("sector") or ""
+        if ind and ind not in ("nan", "None", "未分類"):
+            scan_df.at[idx, "industry"] = ind
+        if info.get("sector"):
+            scan_df.at[idx, "sector"] = info["sector"]
 
-    # 找出尚缺産業的 symbol（按 score 排序）
-    need_industry = (
+    # ── 找出需要補充的 symbol ──────────────────────────────
+    need = (
         scan_df[scan_df["industry"] == "未分類"]
         .sort_values("score", ascending=False)["symbol"]
         .tolist()[:max_fetch]
     )
+    _p(f"   需補充産業：{len(need)} 支（上限 {max_fetch}）")
 
-    if not need_industry:
+    if not need:
         return scan_df
 
-    logger.info(f"Tiingo 補充 {len(need_industry)} 支産業資訊...")
+    # ── 逐一呼叫 Tiingo metadata ──────────────────────────
     new_cache: list[dict] = []
+    success = 0
 
-    for i, sym in enumerate(need_industry):
+    for i, sym in enumerate(need):
         try:
-            url  = TIINGO_META_URL.format(ticker=sym.lower())
             resp = requests.get(
-                url,
+                TIINGO_META_URL.format(ticker=sym.lower()),
                 headers={"Authorization": f"Token {api_key}"},
                 timeout=8,
             )
             if resp.status_code == 200:
-                d = resp.json()
-                info = {
-                    "symbol":   sym,
-                    "name":     d.get("name", sym),
-                    "sector":   d.get("sector", ""),
-                    "industry": d.get("industry") or d.get("sector") or "未分類",
-                }
-                cache_map[sym] = {"name": info["name"], "industry": info["industry"]}
-                new_cache.append(info)
-        except Exception:
-            pass
+                d    = resp.json()
+                name = d.get("name") or sym
+                sec  = d.get("sector") or ""
+                ind  = d.get("industry") or sec or "未分類"
 
-        if i > 0 and i % 100 == 0:
-            time.sleep(0.5)   # 避免觸發 Tiingo rate limit
+                # 更新 scan_df
+                rows = scan_df.index[scan_df["symbol"] == sym].tolist()
+                for row_idx in rows:
+                    if name:
+                        scan_df.at[row_idx, "name"] = name
+                    if ind and ind != "未分類":
+                        scan_df.at[row_idx, "industry"] = ind
+                    if sec:
+                        scan_df.at[row_idx, "sector"] = sec
 
-    # 更新 scan_df
+                cache_map[sym] = {"name": name, "industry": ind, "sector": sec}
+                new_cache.append({"symbol": sym, "name": name, "sector": sec, "industry": ind})
+                success += 1
+
+        except Exception as e:
+            logger.debug(f"{sym} Tiingo metadata 失敗：{e}")
+
+        if i > 0 and i % 200 == 0:
+            time.sleep(0.3)
+            _p(f"   産業補充進度：{i}/{len(need)}（成功 {success} 支）")
+
+    _p(f"   産業補充完成：{success}/{len(need)} 支取得資料")
+
+    # ── 更新本地快取 ───────────────────────────────────────
     if new_cache:
-        new_map = {r["symbol"]: r for r in new_cache}
-
-        def _apply_new(row: pd.Series) -> pd.Series:
-            info = new_map.get(row["symbol"])
-            if info:
-                if info.get("name"):
-                    row["name"] = info["name"]
-                if info.get("industry") not in ("", "nan", "None", "未分類", None):
-                    row["industry"] = info["industry"]
-            return row
-
-        scan_df = scan_df.apply(_apply_new, axis=1)
-
-        # 更新本地快取（合併舊有 + 新增）
         _update_industry_cache(new_cache)
-        logger.info(f"産業快取已更新（新增 {len(new_cache)} 支）")
 
     return scan_df
 
