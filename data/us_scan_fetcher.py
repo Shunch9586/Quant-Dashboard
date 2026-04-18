@@ -485,7 +485,7 @@ def _tiingo_fetch_one(
                 return None
 
             df = pd.DataFrame(data)
-            df["date"]      = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
+            df["date"]      = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
             # 優先取 adjClose；若無則取 close
             close_col = "adjClose" if "adjClose" in df.columns else "close"
             vol_col   = "adjVolume" if "adjVolume" in df.columns else "volume"
