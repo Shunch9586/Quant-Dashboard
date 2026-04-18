@@ -38,7 +38,7 @@ SEC_TICKERS_URL    = "https://www.sec.gov/files/company_tickers.json"
 NASDAQ_LISTED_URL  = "https://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt"
 OTHER_LISTED_URL   = "https://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.txt"
 
-BATCH_SIZE        = 200      # yfinance 每批張數
+BATCH_SIZE        = 100      # yfinance 每批張數（100 降低單批 timeout 機率）
 MAX_SYMBOLS       = 7000     # 上限（避免記憶體不足）
 MIN_PRICE         = 1.0      # 過濾低價（放寬至 $1，避免誤殺正常股）
 MIN_AVG_VOLUME    = 50_000   # 過濾低流動性（放寬至 5 萬，涵蓋中小型股）
@@ -343,6 +343,22 @@ def _try_nasdaq_ftp() -> list[str]:
 # ② 批次下載價格（yfinance）
 # ════════════════════════════════════════════════════════
 
+# yfinance 不同版本 Close 欄位名稱不一（0.2.50+ 改用 "Price"）
+_CLOSE_KEYS = ("Close", "Price", "Adj Close")
+
+
+def _pick_close(frame) -> Optional[pd.Series]:
+    """從 DataFrame 或 dict-like 中找到第一個非空的 Close 欄位"""
+    for key in _CLOSE_KEYS:
+        try:
+            val = frame.get(key)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return None
+
+
 def _extract_close_vol(
     raw: pd.DataFrame,
     sym: str,
@@ -351,48 +367,53 @@ def _extract_close_vol(
     """
     從 yfinance 下載結果取出單一 ticker 的 Close / Volume Series。
 
-    yfinance 在不同版本 / 批量下可能回傳：
-      A. flat DataFrame（columns=[Open,High,Low,Close,Volume]）— 單 ticker 或批量中只剩 1 支
-      B. MultiIndex (field, ticker) — group_by="column"（預設）
-      C. MultiIndex (ticker, field) — group_by="ticker"
-    統一以「找到 Close + Volume 欄位」作為判斷依據。
+    yfinance 不同版本可能回傳：
+      A. flat DataFrame — 單 ticker 或批量中只剩 1 支有資料
+      B. MultiIndex (field, ticker) — group_by="column"（預設，舊版 field="Close"）
+      C. MultiIndex (field, ticker) — 新版 field 改名為 "Price"
+      D. MultiIndex (ticker, field) — group_by="ticker"
+    所有路徑都以 _CLOSE_KEYS 嘗試，不寫死 "Close"。
     """
     cols = raw.columns
 
     # ── A. 無 MultiIndex（flat）──────────────────────────
     if not isinstance(cols, pd.MultiIndex):
         if batch_len == 1:
-            close = raw.get("Close") or raw.get("Adj Close")
+            close = _pick_close(raw)
             vol   = raw.get("Volume")
             return (close, vol) if close is not None else (None, None)
-        # 批量但回傳 flat → 只有 1 支有資料，但我們不知道是哪支
-        # 直接跳過，避免把同一份資料錯誤地賦給每支
+        # 批量回傳 flat → 只剩 1 支有資料但無法判斷是哪支，跳過
         return None, None
 
     lvl0_set = set(cols.get_level_values(0))
 
-    # ── B. (field, ticker)：Close 在 level-0 ─────────────
-    if "Close" in lvl0_set:
-        close_frame = raw["Close"]   # DataFrame，columns = tickers
+    # ── B/C. (field, ticker)：某個 close key 在 level-0 ──
+    close_key = next((k for k in _CLOSE_KEYS if k in lvl0_set), None)
+    if close_key:
+        close_frame = raw[close_key]   # DataFrame，columns = tickers
         vol_frame   = raw.get("Volume")
         if isinstance(close_frame, pd.Series):
-            # 整個 DataFrame 只有這 1 支
+            # 整個 batch 只有 1 支有資料
             return (close_frame, vol_frame) if batch_len == 1 else (None, None)
         close = close_frame.get(sym)
-        vol   = vol_frame.get(sym) if vol_frame is not None and isinstance(vol_frame, pd.DataFrame) else None
+        vol   = (
+            vol_frame.get(sym)
+            if vol_frame is not None and isinstance(vol_frame, pd.DataFrame)
+            else None
+        )
         return close, vol
 
-    # ── C. (ticker, field)：ticker 在 level-0 ────────────
+    # ── D. (ticker, field)：ticker 在 level-0 ────────────
     if sym in lvl0_set:
         sym_df = raw[sym]
-        close  = sym_df.get("Close") or sym_df.get("Adj Close")
+        close  = _pick_close(sym_df)
         vol    = sym_df.get("Volume")
         return close, vol
 
-    # ── D. 保底：掃描 level-1 是否有 ticker ──────────────
+    # ── E. 保底：level-1 掃描 ────────────────────────────
     if sym in set(cols.get_level_values(1)):
         sym_df = raw.xs(sym, axis=1, level=1)
-        close  = sym_df.get("Close") or sym_df.get("Adj Close")
+        close  = _pick_close(sym_df)
         vol    = sym_df.get("Volume")
         return close, vol
 
