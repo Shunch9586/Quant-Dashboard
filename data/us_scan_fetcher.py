@@ -425,10 +425,123 @@ def _batch_download(
     progress_cb: Callable,
 ) -> dict[str, pd.DataFrame]:
     """
-    用 yfinance 批次下載調整後收盤 + 成交量。
-    每批 BATCH_SIZE 支，回傳 {symbol: price_df}。
-    使用 group_by="column"（field-first，最穩定跨版本）。
+    優先用 Tiingo 逐支抓歷史價格（平行 10 thread）；
+    無 API Key 時 fallback 到 yfinance 批次下載。
+
+    Tiingo Power Plan 限制 20,000 req/hr，10 thread 並行即可在 3-5 分鐘內
+    完成 5000+ 支，且對 Streamlit Cloud IP 無封鎖問題。
     """
+    api_key = config.fresh("TIINGO_API_KEY")
+    if api_key:
+        return _tiingo_historical_download(symbols, progress_cb, api_key)
+    else:
+        logger.warning("TIINGO_API_KEY 未設定，改用 yfinance（Streamlit Cloud 可能受限）")
+        return _yfinance_batch_download(symbols, progress_cb)
+
+
+# ── Tiingo 歷史資料（主力）─────────────────────────────────
+
+TIINGO_HIST_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
+_TIINGO_WORKERS = 10   # 並行 thread 數；10 × ~300ms ≈ 33 req/s，在 20k/hr 限制內
+
+
+def _tiingo_fetch_one(
+    sym: str,
+    start_date: str,
+    api_key: str,
+) -> Optional[pd.DataFrame]:
+    """單支股票：呼叫 Tiingo daily prices，回傳 {date, adj_close, volume}。"""
+    url = TIINGO_HIST_URL.format(ticker=sym.lower())
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                url,
+                params={"startDate": start_date, "resampleFreq": "daily", "token": api_key},
+                timeout=12,
+            )
+            if resp.status_code == 429:          # rate limit → 指數退避
+                time.sleep(2 ** attempt)
+                continue
+            if resp.status_code in (404, 400):   # 找不到 / 不支援
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                return None
+
+            df = pd.DataFrame(data)
+            df["date"]      = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
+            # 優先取 adjClose；若無則取 close
+            close_col = "adjClose" if "adjClose" in df.columns else "close"
+            vol_col   = "adjVolume" if "adjVolume" in df.columns else "volume"
+            df = df.rename(columns={close_col: "adj_close", vol_col: "volume"})
+            df = df[["date", "adj_close", "volume"]].copy()
+            df["adj_close"] = pd.to_numeric(df["adj_close"], errors="coerce")
+            df["volume"]    = pd.to_numeric(df["volume"],    errors="coerce").fillna(0.0)
+            df = df.dropna(subset=["adj_close"]).reset_index(drop=True)
+            return df
+
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)
+            else:
+                logger.debug(f"{sym} Tiingo hist 失敗：{e}")
+    return None
+
+
+def _tiingo_historical_download(
+    symbols: list[str],
+    progress_cb: Callable,
+    api_key: str,
+) -> dict[str, pd.DataFrame]:
+    """
+    用 ThreadPoolExecutor(_TIINGO_WORKERS) 並行呼叫 Tiingo，
+    過濾低流動性，回傳 {symbol: price_df}。
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    start_date = (date.today() - timedelta(days=430)).isoformat()
+    result: dict[str, pd.DataFrame] = {}
+    total = len(symbols)
+    done_count = [0]
+    lock = threading.Lock()
+
+    def _fetch(sym: str):
+        df = _tiingo_fetch_one(sym, start_date, api_key)
+        with lock:
+            done_count[0] += 1
+            cnt = done_count[0]
+        if cnt % 500 == 0 or cnt == total:
+            progress_cb(f"   下載進度：{cnt}/{total} 支（有效：{len(result)} 支）")
+        if df is None or len(df) < 50:
+            return sym, None
+        last_price = float(df["adj_close"].iloc[-1])
+        avg_vol    = float(df["volume"].tail(20).mean())
+        if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
+            return sym, None
+        return sym, df
+
+    with ThreadPoolExecutor(max_workers=_TIINGO_WORKERS) as ex:
+        futures = {ex.submit(_fetch, s): s for s in symbols}
+        for fut in as_completed(futures):
+            try:
+                sym, df = fut.result()
+                if df is not None:
+                    result[sym] = df
+            except Exception:
+                pass
+
+    return result
+
+
+# ── yfinance 批次下載（fallback）──────────────────────────
+
+def _yfinance_batch_download(
+    symbols: list[str],
+    progress_cb: Callable,
+) -> dict[str, pd.DataFrame]:
+    """yfinance fallback（Streamlit Cloud 可能受 Yahoo Finance IP 封鎖限制）。"""
     try:
         import yfinance as yf
     except ImportError:
@@ -444,12 +557,11 @@ def _batch_download(
             raw = yf.download(
                 tickers=" ".join(batch),
                 period="14mo",
-                group_by="column",   # field-first MultiIndex，跨版本最穩定
+                group_by="column",
                 auto_adjust=True,
                 progress=False,
                 threads=True,
             )
-
             if raw.empty:
                 continue
 
@@ -458,39 +570,32 @@ def _batch_download(
                     close_s, vol_s = _extract_close_vol(raw, sym, len(batch))
                     if close_s is None:
                         continue
-
                     close_s = pd.to_numeric(close_s, errors="coerce")
-                    vol_s   = pd.to_numeric(vol_s,   errors="coerce") if vol_s is not None else pd.Series(
-                        0.0, index=close_s.index
+                    vol_s   = (
+                        pd.to_numeric(vol_s, errors="coerce")
+                        if vol_s is not None
+                        else pd.Series(0.0, index=close_s.index)
                     )
-
                     df = pd.DataFrame({"adj_close": close_s, "volume": vol_s})
                     df.index.name = "date"
                     df = df.reset_index().dropna(subset=["adj_close"])
                     df["volume"] = df["volume"].fillna(0.0)
-
                     if len(df) < 50:
                         continue
-
                     last_price = float(df["adj_close"].iloc[-1])
                     avg_vol    = float(df["volume"].tail(20).mean())
                     if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
                         continue
-
                     result[sym] = df
-
                 except Exception:
                     continue
 
         except Exception as e:
-            logger.warning(f"批次 {batch_start // BATCH_SIZE + 1} 下載失敗：{e}")
+            logger.warning(f"yfinance 批次 {batch_start // BATCH_SIZE + 1} 失敗：{e}")
 
         done = min(batch_start + BATCH_SIZE, total)
         if done % (BATCH_SIZE * 5) == 0 or done >= total:
-            progress_cb(
-                f"   下載進度：{done}/{total} 支"
-                f"（有效：{len(result)} 支）"
-            )
+            progress_cb(f"   yfinance 進度：{done}/{total}（有效：{len(result)} 支）")
 
     return result
 
