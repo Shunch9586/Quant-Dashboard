@@ -458,19 +458,26 @@ def _tiingo_fetch_one(
     start_date: str,
     api_key: str,
 ) -> Optional[pd.DataFrame]:
-    """單支股票：呼叫 Tiingo daily prices，回傳 {date, adj_close, volume}。"""
+    """
+    單支股票：呼叫 Tiingo daily prices，回傳 {date, adj_close, volume}。
+
+    注意：resampleFreq 只接受 monthly/weekly/quarterly/annually，
+    daily endpoint 預設即為日線，不傳此參數。
+    """
     url = TIINGO_HIST_URL.format(ticker=sym.lower())
+    headers = {"Authorization": f"Token {api_key}"}    # 與 tiingo_utils.py 一致
+    params  = {"startDate": start_date}                 # 不傳 resampleFreq，預設日線
+
     for attempt in range(3):
         try:
-            resp = requests.get(
-                url,
-                params={"startDate": start_date, "resampleFreq": "daily", "token": api_key},
-                timeout=12,
-            )
+            resp = requests.get(url, headers=headers, params=params, timeout=12)
             if resp.status_code == 429:          # rate limit → 指數退避
                 time.sleep(2 ** attempt)
                 continue
             if resp.status_code in (404, 400):   # 找不到 / 不支援
+                return None
+            if resp.status_code == 403:
+                logger.warning(f"Tiingo 403 Forbidden（{sym}）— 可能需要升級方案或 key 無效")
                 return None
             resp.raise_for_status()
             data = resp.json()
@@ -491,9 +498,9 @@ def _tiingo_fetch_one(
 
         except Exception as e:
             if attempt < 2:
-                time.sleep(1)
+                time.sleep(0.5)
             else:
-                logger.debug(f"{sym} Tiingo hist 失敗：{e}")
+                logger.debug(f"{sym} Tiingo hist 失敗（attempt {attempt}）：{e}")
     return None
 
 
@@ -503,25 +510,17 @@ def _tiingo_historical_download(
     api_key: str,
 ) -> dict[str, pd.DataFrame]:
     """
-    用 ThreadPoolExecutor(_TIINGO_WORKERS) 並行呼叫 Tiingo，
-    過濾低流動性，回傳 {symbol: price_df}。
+    用 ThreadPoolExecutor(_TIINGO_WORKERS) 並行呼叫 Tiingo。
+    progress_cb 只從主 thread 呼叫（Streamlit UI thread-safe）。
     """
-    import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     start_date = (date.today() - timedelta(days=430)).isoformat()
     result: dict[str, pd.DataFrame] = {}
-    total = len(symbols)
-    done_count = [0]
-    lock = threading.Lock()
+    total  = len(symbols)
 
     def _fetch(sym: str):
         df = _tiingo_fetch_one(sym, start_date, api_key)
-        with lock:
-            done_count[0] += 1
-            cnt = done_count[0]
-        if cnt % 500 == 0 or cnt == total:
-            progress_cb(f"   下載進度：{cnt}/{total} 支（有效：{len(result)} 支）")
         if df is None or len(df) < 50:
             return sym, None
         last_price = float(df["adj_close"].iloc[-1])
@@ -530,8 +529,15 @@ def _tiingo_historical_download(
             return sym, None
         return sym, df
 
+    # 先對第一支測試，讓用戶儘早看到結果/錯誤
+    first_sym, first_df = _fetch(symbols[0])
+    if first_df is not None:
+        result[first_sym] = first_df
+    progress_cb(f"   連線測試（{symbols[0]}）：{'✅ 成功' if first_df is not None else '❌ 失敗，請確認 API key / 方案'}。開始批次下載...")
+
     with ThreadPoolExecutor(max_workers=_TIINGO_WORKERS) as ex:
-        futures = {ex.submit(_fetch, s): s for s in symbols}
+        futures = {ex.submit(_fetch, s): s for s in symbols[1:]}
+        done = 1   # 已計 first_sym
         for fut in as_completed(futures):
             try:
                 sym, df = fut.result()
@@ -539,6 +545,10 @@ def _tiingo_historical_download(
                     result[sym] = df
             except Exception:
                 pass
+            done += 1
+            # progress 從主 thread 更新（as_completed 迭代在主 thread）
+            if done % 500 == 0 or done >= total:
+                progress_cb(f"   下載進度：{done}/{total} 支（有效：{len(result)} 支）")
 
     return result
 
