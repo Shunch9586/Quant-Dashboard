@@ -504,6 +504,39 @@ def _tiingo_fetch_one(
     return None
 
 
+def _probe_tiingo_eod(api_key: str) -> tuple[bool, str]:
+    """
+    用 AAPL 快速測試 Tiingo EOD endpoint 是否可用。
+    回傳 (可用?, 診斷訊息)
+    """
+    url = TIINGO_HIST_URL.format(ticker="aapl")
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Token {api_key}"},
+            params={"startDate": (date.today() - timedelta(days=7)).isoformat()},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return True, f"✅ AAPL 連線成功，取得 {len(data)} 筆"
+        # 嘗試解析錯誤訊息
+        try:
+            detail = resp.json().get("detail", resp.text[:120])
+        except Exception:
+            detail = resp.text[:120]
+        hints = {
+            403: f"HTTP 403 — {detail}（key 無效或方案不含 EOD 資料）",
+            401: f"HTTP 401 — 認證失敗，請確認 key 正確",
+            404: f"HTTP 404 — endpoint 路徑錯誤",
+            402: f"HTTP 402 — 需要付費升級方案",
+        }
+        msg = hints.get(resp.status_code, f"HTTP {resp.status_code} — {detail}")
+        return False, msg
+    except Exception as e:
+        return False, f"連線異常：{e}"
+
+
 def _tiingo_historical_download(
     symbols: list[str],
     progress_cb: Callable,
@@ -512,8 +545,18 @@ def _tiingo_historical_download(
     """
     用 ThreadPoolExecutor(_TIINGO_WORKERS) 並行呼叫 Tiingo。
     progress_cb 只從主 thread 呼叫（Streamlit UI thread-safe）。
+    若 Tiingo EOD probe 失敗則自動 fallback 到 yfinance。
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # ── 先 probe，確認 EOD 可用 ────────────────────────────
+    ok, probe_msg = _probe_tiingo_eod(api_key)
+    key_hint = f"（key 前 4 碼：{api_key[:4]}****）"
+    progress_cb(f"   Tiingo EOD probe {key_hint}：{probe_msg}")
+
+    if not ok:
+        progress_cb("   ⚠️  Tiingo EOD 不可用，切換至 yfinance fallback...")
+        return _yfinance_batch_download(symbols, progress_cb)
 
     start_date = (date.today() - timedelta(days=430)).isoformat()
     result: dict[str, pd.DataFrame] = {}
@@ -529,15 +572,9 @@ def _tiingo_historical_download(
             return sym, None
         return sym, df
 
-    # 先對第一支測試，讓用戶儘早看到結果/錯誤
-    first_sym, first_df = _fetch(symbols[0])
-    if first_df is not None:
-        result[first_sym] = first_df
-    progress_cb(f"   連線測試（{symbols[0]}）：{'✅ 成功' if first_df is not None else '❌ 失敗，請確認 API key / 方案'}。開始批次下載...")
-
     with ThreadPoolExecutor(max_workers=_TIINGO_WORKERS) as ex:
-        futures = {ex.submit(_fetch, s): s for s in symbols[1:]}
-        done = 1   # 已計 first_sym
+        futures = {ex.submit(_fetch, s): s for s in symbols}
+        done = 0
         for fut in as_completed(futures):
             try:
                 sym, df = fut.result()
@@ -546,7 +583,6 @@ def _tiingo_historical_download(
             except Exception:
                 pass
             done += 1
-            # progress 從主 thread 更新（as_completed 迭代在主 thread）
             if done % 500 == 0 or done >= total:
                 progress_cb(f"   下載進度：{done}/{total} 支（有效：{len(result)} 支）")
 
