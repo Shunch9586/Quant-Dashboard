@@ -159,7 +159,14 @@ def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, 
             progress_cb(msg)
 
     try:
-        # ① 股票清單
+        # ① API key 診斷
+        tiingo_key = config.fresh("TIINGO_API_KEY")
+        if tiingo_key:
+            _p("🔑 Tiingo API key 已設定（將使用 Tiingo 歷史資料）")
+        else:
+            _p("⚠️  Tiingo API key 未找到，將改用 yfinance（Streamlit Cloud 可能受限）")
+
+        # ② 股票清單
         _p("📋 取得全市場股票清單（Tiingo → SEC → NASDAQ FTP）...")
         symbols = _get_us_symbols()
         _p(f"   取得 {len(symbols)} 支（過濾 ETF / 低流動性後）")
@@ -167,13 +174,14 @@ def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, 
         if not symbols:
             return False, "無法取得美股清單（Tiingo / SEC / NASDAQ FTP 均失敗）"
 
-        # ② 批次下載價格
-        _p(f"📈 批次下載 {len(symbols)} 支近 14 個月價格（yfinance）...")
+        # ③ 批次下載價格
+        src = "Tiingo" if tiingo_key else "yfinance"
+        _p(f"📈 批次下載 {len(symbols)} 支近 14 個月價格（{src}）...")
         price_data = _batch_download(symbols, _p)
         _p(f"   成功下載 {len(price_data)} 支有效資料")
 
         if not price_data:
-            return False, "yfinance 回傳空資料，請稍後再試"
+            return False, f"{src} 回傳空資料，請確認 API key 並稍後再試"
 
         # ③ 計算技術特徵
         _p("⚙️  計算技術特徵（Score / MA / 動能）...")
@@ -552,6 +560,7 @@ def _yfinance_batch_download(
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = symbols[batch_start : batch_start + BATCH_SIZE]
+        done  = min(batch_start + BATCH_SIZE, total)   # 先算好，確保 continue 也能更新進度
 
         try:
             raw = yf.download(
@@ -562,38 +571,35 @@ def _yfinance_batch_download(
                 progress=False,
                 threads=True,
             )
-            if raw.empty:
-                continue
-
-            for sym in batch:
-                try:
-                    close_s, vol_s = _extract_close_vol(raw, sym, len(batch))
-                    if close_s is None:
+            if not raw.empty:
+                for sym in batch:
+                    try:
+                        close_s, vol_s = _extract_close_vol(raw, sym, len(batch))
+                        if close_s is None:
+                            continue
+                        close_s = pd.to_numeric(close_s, errors="coerce")
+                        vol_s   = (
+                            pd.to_numeric(vol_s, errors="coerce")
+                            if vol_s is not None
+                            else pd.Series(0.0, index=close_s.index)
+                        )
+                        df = pd.DataFrame({"adj_close": close_s, "volume": vol_s})
+                        df.index.name = "date"
+                        df = df.reset_index().dropna(subset=["adj_close"])
+                        df["volume"] = df["volume"].fillna(0.0)
+                        if len(df) < 50:
+                            continue
+                        last_price = float(df["adj_close"].iloc[-1])
+                        avg_vol    = float(df["volume"].tail(20).mean())
+                        if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
+                            continue
+                        result[sym] = df
+                    except Exception:
                         continue
-                    close_s = pd.to_numeric(close_s, errors="coerce")
-                    vol_s   = (
-                        pd.to_numeric(vol_s, errors="coerce")
-                        if vol_s is not None
-                        else pd.Series(0.0, index=close_s.index)
-                    )
-                    df = pd.DataFrame({"adj_close": close_s, "volume": vol_s})
-                    df.index.name = "date"
-                    df = df.reset_index().dropna(subset=["adj_close"])
-                    df["volume"] = df["volume"].fillna(0.0)
-                    if len(df) < 50:
-                        continue
-                    last_price = float(df["adj_close"].iloc[-1])
-                    avg_vol    = float(df["volume"].tail(20).mean())
-                    if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
-                        continue
-                    result[sym] = df
-                except Exception:
-                    continue
 
         except Exception as e:
             logger.warning(f"yfinance 批次 {batch_start // BATCH_SIZE + 1} 失敗：{e}")
 
-        done = min(batch_start + BATCH_SIZE, total)
         if done % (BATCH_SIZE * 5) == 0 or done >= total:
             progress_cb(f"   yfinance 進度：{done}/{total}（有效：{len(result)} 支）")
 
