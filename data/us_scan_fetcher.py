@@ -552,9 +552,18 @@ def _tiingo_fetch_one(
                 time.sleep(2 ** attempt)
                 continue
             if resp.status_code in (404, 400):   # 找不到 / 不支援
+                try:
+                    _detail = resp.json().get("detail", resp.text[:120])
+                except Exception:
+                    _detail = resp.text[:120]
+                logger.debug(f"{sym} HTTP {resp.status_code}: {_detail}")
                 return None
             if resp.status_code == 403:
-                logger.warning(f"Tiingo 403 Forbidden（{sym}）— 可能需要升級方案或 key 無效")
+                try:
+                    _detail = resp.json().get("detail", resp.text[:120])
+                except Exception:
+                    _detail = resp.text[:120]
+                logger.warning(f"Tiingo 403 Forbidden（{sym}）: {_detail}")
                 return None
             resp.raise_for_status()
             data = resp.json()
@@ -629,25 +638,39 @@ def _tiingo_scan(
     rows:  list[dict] = []
     total = len(symbols)
 
-    # ── 主執行緒預測試（診斷用）──────────────────────────────
-    progress_cb(f"   [診斷] AAPL 全期資料測試（startDate={start_date}）...")
-    try:
-        _test_df = _tiingo_fetch_one("AAPL", start_date, api_key)
-        if _test_df is None:
-            progress_cb("   [診斷] ⚠️  AAPL 全期請求回傳 None → API 或方案問題")
-        elif len(_test_df) < 50:
-            progress_cb(f"   [診斷] ⚠️  AAPL 只有 {len(_test_df)} 筆（需 ≥50）→ 方案可能限制歷史深度")
-        else:
-            last_p  = float(_test_df["adj_close"].iloc[-1])
-            avg_v   = float(_test_df["volume"].tail(20).mean())
-            test_row = _build_scan_row("AAPL", _test_df)
-            progress_cb(
-                f"   [診斷] ✅ AAPL OK：{len(_test_df)} 筆，"
-                f"price=${last_p:.2f}，avgVol={avg_v:,.0f}，"
-                f"row={'OK' if test_row else 'None（_build_scan_row 失敗）'}"
+    # ── 多日期範圍探測（找出方案允許的歷史深度） ────────────
+    progress_cb("   [診斷] 探測 Tiingo 方案可用歷史深度...")
+    test_url = TIINGO_HIST_URL.format(ticker="aapl")
+    best_days = 0
+    for days_back in [7, 30, 90, 180, 365, 430]:
+        sd = (date.today() - timedelta(days=days_back)).isoformat()
+        try:
+            _r = requests.get(
+                test_url,
+                headers={"Authorization": f"Token {api_key}"},
+                params={"startDate": sd},
+                timeout=12,
             )
-    except Exception as ex:
-        progress_cb(f"   [診斷] ❌ AAPL 例外：{ex}")
+            if _r.status_code == 200:
+                _rows = _r.json()
+                progress_cb(f"   [診斷] {days_back:4d}天（{sd}）→ ✅ {len(_rows)} 筆")
+                best_days = days_back
+            else:
+                try:
+                    _detail = _r.json().get("detail", _r.text[:120])
+                except Exception:
+                    _detail = _r.text[:120]
+                progress_cb(f"   [診斷] {days_back:4d}天（{sd}）→ ❌ HTTP {_r.status_code}: {_detail}")
+        except Exception as _ex:
+            progress_cb(f"   [診斷] {days_back:4d}天 → 例外: {_ex}")
+
+    if best_days == 0:
+        progress_cb("   ❌ AAPL 在所有日期範圍均失敗，無法繼續")
+        return []
+
+    # 用實際可用深度（不超過 430 天）
+    start_date = (date.today() - timedelta(days=min(best_days, 430))).isoformat()
+    progress_cb(f"   [診斷] 確定使用 startDate={start_date}（{min(best_days, 430)} 天）")
 
     # ── 失敗類型計數（輔助診斷） ─────────────────────────────
     _cnt: dict[str, int] = {
