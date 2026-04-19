@@ -174,19 +174,16 @@ def run_us_scan(fs=None, progress_cb: Optional[Callable] = None) -> tuple[bool, 
         if not symbols:
             return False, "無法取得美股清單（Tiingo / SEC / NASDAQ FTP 均失敗）"
 
-        # ③ 批次下載價格
+        # ③ 下載 + 即時計算特徵（streaming pipeline，不存原始 price data）
         src = "Tiingo" if tiingo_key else "yfinance"
-        _p(f"📈 批次下載 {len(symbols)} 支近 14 個月價格（{src}）...")
-        price_data = _batch_download(symbols, _p)
-        _p(f"   成功下載 {len(price_data)} 支有效資料")
+        _p(f"📈 下載 + 特徵計算 {len(symbols)} 支（{src}，低記憶體模式）...")
+        scan_rows = _download_and_scan(symbols, _p, tiingo_key)
+        _p(f"   完成：{len(scan_rows)} 支有效資料")
 
-        if not price_data:
+        if not scan_rows:
             return False, f"{src} 回傳空資料，請確認 API key 並稍後再試"
 
-        # ③ 計算技術特徵
-        _p("⚙️  計算技術特徵（Score / MA / 動能）...")
-        scan_df = _compute_scan(price_data, _p)
-        _p(f"   特徵計算完成：{len(scan_df)} 支")
+        scan_df = pd.DataFrame(scan_rows)
 
         # ④ 補充産業資訊
         _p("🏷️  補充産業分類（Tiingo，優先高分股）...")
@@ -428,12 +425,92 @@ def _extract_close_vol(
     return None, None
 
 
+def _build_scan_row(sym: str, df: pd.DataFrame) -> Optional[dict]:
+    """
+    從單支股票的 price DataFrame 計算特徵，回傳 scan row dict。
+    計算完畢後 df 即可被 GC 回收（streaming pipeline 的關鍵）。
+    """
+    try:
+        feats     = compute_features(df)
+        last      = df.iloc[-1]
+        close     = float(last["adj_close"])
+        vol       = float(last["volume"])
+        avg_vol   = feats["avg_volume_20d"]
+        vol_ratio = vol / avg_vol if avg_vol > 0 else 0.0
+        ma50      = feats["ma50"]
+        ma200     = feats["ma200"]
+        above_ma50  = close > ma50  if ma50  > 0 else False
+        above_ma200 = close > ma200 if ma200 > 0 else False
+        ma50_above  = ma50  > ma200 if ma50  > 0 and ma200 > 0 else False
+        trend = (
+            "bull"  if (above_ma50  and above_ma200 and ma50_above) else
+            "bear"  if (not above_ma50 and not above_ma200 and not ma50_above) else
+            "mixed"
+        )
+        prices   = df["adj_close"].values
+        high_52w = float(prices[-252:].max()) if len(prices) >= 252 else float(prices.max())
+        dist_52w = (close - high_52w) / high_52w if high_52w > 0 else 0.0
+        row_date = last["date"]
+        if hasattr(row_date, "date"):
+            row_date = row_date.date()
+        return {
+            "symbol":             sym,
+            "name":               sym,       # 後續 Tiingo 補充
+            "market":             "US",
+            "industry":           "未分類",  # 後續 Tiingo 補充
+            "date":               row_date,
+            "close":              round(close, 2),
+            "volume":             round(vol),
+            "avg_volume_20d":     round(avg_vol, 0),
+            "ma50":               round(ma50, 2),
+            "ma200":              round(ma200, 2),
+            "score":              round(feats["current_score"], 1),
+            "score_delta":        round(feats["score_delta"], 1),
+            "vol_ratio_20d":      round(vol_ratio, 2),
+            "dist_to_52w_high":   round(dist_52w, 4),
+            "adj_close_to_ma50":  round(feats["adj_close_to_ma50_ratio"], 4),
+            "adj_close_to_ma200": round(close / ma200 - 1, 4) if ma200 > 0 else 0.0,
+            "momentum_20d":       round(feats["momentum_raw"], 4),
+            "trend_state":        trend,
+            "above_ma50":         above_ma50,
+            "above_ma200":        above_ma200,
+            "ma50_above_ma200":   ma50_above,
+            "near_52w_high":      dist_52w > -0.05,
+            "high_volume":        vol_ratio > 2.0,
+            "vcp_flag":           False,
+            "breakout_flag":      False,
+            "reversal_flag":      False,
+        }
+    except Exception as e:
+        logger.debug(f"{sym} _build_scan_row 失敗：{e}")
+        return None
+
+
+def _download_and_scan(
+    symbols: list[str],
+    progress_cb: Callable,
+    api_key: Optional[str] = None,
+) -> list[dict]:
+    """
+    Streaming pipeline：下載完一支立即計算特徵並丟棄 price data。
+    記憶體峰值 ≈ _TIINGO_WORKERS 支股票的 price data（~幾 MB），
+    而非全部 5000 支（~500MB）。
+    """
+    if api_key:
+        ok, probe_msg = _probe_tiingo_eod(api_key)
+        progress_cb(f"   Tiingo EOD probe（key 前 4 碼：{api_key[:4]}****）：{probe_msg}")
+        if ok:
+            return _tiingo_scan(symbols, progress_cb, api_key)
+        progress_cb("   ⚠️  Tiingo EOD 不可用，切換至 yfinance fallback...")
+    return _yfinance_scan(symbols, progress_cb)
+
+
 def _batch_download(
     symbols: list[str],
     progress_cb: Callable,
 ) -> dict[str, pd.DataFrame]:
     """
-    優先用 Tiingo 逐支抓歷史價格（平行 10 thread）；
+    【已廢棄，保留供外部相容】優先用 Tiingo 逐支抓歷史價格（平行 10 thread）；
     無 API Key 時 fallback 到 yfinance 批次下載。
 
     Tiingo Power Plan 限制 20,000 req/hr，10 thread 並行即可在 3-5 分鐘內
@@ -537,76 +614,66 @@ def _probe_tiingo_eod(api_key: str) -> tuple[bool, str]:
         return False, f"連線異常：{e}"
 
 
-def _tiingo_historical_download(
+def _tiingo_scan(
     symbols: list[str],
     progress_cb: Callable,
     api_key: str,
-) -> dict[str, pd.DataFrame]:
+) -> list[dict]:
     """
-    用 ThreadPoolExecutor(_TIINGO_WORKERS) 並行呼叫 Tiingo。
-    progress_cb 只從主 thread 呼叫（Streamlit UI thread-safe）。
-    若 Tiingo EOD probe 失敗則自動 fallback 到 yfinance。
+    Tiingo streaming scan：下載一支 → 立即計算特徵 → 丟棄 price data。
+    記憶體峰值 ≈ _TIINGO_WORKERS 支股票的 price data，不累積整個 dict。
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # ── 先 probe，確認 EOD 可用 ────────────────────────────
-    ok, probe_msg = _probe_tiingo_eod(api_key)
-    key_hint = f"（key 前 4 碼：{api_key[:4]}****）"
-    progress_cb(f"   Tiingo EOD probe {key_hint}：{probe_msg}")
-
-    if not ok:
-        progress_cb("   ⚠️  Tiingo EOD 不可用，切換至 yfinance fallback...")
-        return _yfinance_batch_download(symbols, progress_cb)
-
     start_date = (date.today() - timedelta(days=430)).isoformat()
-    result: dict[str, pd.DataFrame] = {}
-    total  = len(symbols)
+    rows:  list[dict] = []
+    total = len(symbols)
 
-    def _fetch(sym: str):
+    def _process(sym: str) -> Optional[dict]:
         df = _tiingo_fetch_one(sym, start_date, api_key)
         if df is None or len(df) < 50:
-            return sym, None
+            return None
         last_price = float(df["adj_close"].iloc[-1])
         avg_vol    = float(df["volume"].tail(20).mean())
         if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
-            return sym, None
-        return sym, df
+            return None
+        return _build_scan_row(sym, df)   # df 在這裡計算完就可被 GC
 
     with ThreadPoolExecutor(max_workers=_TIINGO_WORKERS) as ex:
-        futures = {ex.submit(_fetch, s): s for s in symbols}
+        futures = {ex.submit(_process, s): s for s in symbols}
         done = 0
         for fut in as_completed(futures):
             try:
-                sym, df = fut.result()
-                if df is not None:
-                    result[sym] = df
+                row = fut.result()
+                if row is not None:
+                    rows.append(row)
             except Exception:
                 pass
             done += 1
             if done % 500 == 0 or done >= total:
-                progress_cb(f"   下載進度：{done}/{total} 支（有效：{len(result)} 支）")
+                progress_cb(f"   Tiingo 進度：{done}/{total} 支（有效：{len(rows)} 支）")
 
-    return result
+    return rows
 
 
-# ── yfinance 批次下載（fallback）──────────────────────────
-
-def _yfinance_batch_download(
+def _yfinance_scan(
     symbols: list[str],
     progress_cb: Callable,
-) -> dict[str, pd.DataFrame]:
-    """yfinance fallback（Streamlit Cloud 可能受 Yahoo Finance IP 封鎖限制）。"""
+) -> list[dict]:
+    """
+    yfinance fallback streaming scan：每批下載後立即計算特徵、丟棄原始 DataFrame。
+    """
     try:
         import yfinance as yf
     except ImportError:
         raise ImportError("請先安裝 yfinance：pip install yfinance>=0.2.0")
 
-    result: dict[str, pd.DataFrame] = {}
+    rows:  list[dict] = []
     total = len(symbols)
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = symbols[batch_start : batch_start + BATCH_SIZE]
-        done  = min(batch_start + BATCH_SIZE, total)   # 先算好，確保 continue 也能更新進度
+        done  = min(batch_start + BATCH_SIZE, total)
 
         try:
             raw = yf.download(
@@ -639,7 +706,9 @@ def _yfinance_batch_download(
                         avg_vol    = float(df["volume"].tail(20).mean())
                         if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
                             continue
-                        result[sym] = df
+                        row = _build_scan_row(sym, df)   # 計算完立即丟棄 df
+                        if row is not None:
+                            rows.append(row)
                     except Exception:
                         continue
 
@@ -647,9 +716,9 @@ def _yfinance_batch_download(
             logger.warning(f"yfinance 批次 {batch_start // BATCH_SIZE + 1} 失敗：{e}")
 
         if done % (BATCH_SIZE * 5) == 0 or done >= total:
-            progress_cb(f"   yfinance 進度：{done}/{total}（有效：{len(result)} 支）")
+            progress_cb(f"   yfinance 進度：{done}/{total}（有效：{len(rows)} 支）")
 
-    return result
+    return rows
 
 
 # ════════════════════════════════════════════════════════
