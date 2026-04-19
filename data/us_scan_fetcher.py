@@ -629,30 +629,89 @@ def _tiingo_scan(
     rows:  list[dict] = []
     total = len(symbols)
 
+    # ── 主執行緒預測試（診斷用）──────────────────────────────
+    progress_cb(f"   [診斷] AAPL 全期資料測試（startDate={start_date}）...")
+    try:
+        _test_df = _tiingo_fetch_one("AAPL", start_date, api_key)
+        if _test_df is None:
+            progress_cb("   [診斷] ⚠️  AAPL 全期請求回傳 None → API 或方案問題")
+        elif len(_test_df) < 50:
+            progress_cb(f"   [診斷] ⚠️  AAPL 只有 {len(_test_df)} 筆（需 ≥50）→ 方案可能限制歷史深度")
+        else:
+            last_p  = float(_test_df["adj_close"].iloc[-1])
+            avg_v   = float(_test_df["volume"].tail(20).mean())
+            test_row = _build_scan_row("AAPL", _test_df)
+            progress_cb(
+                f"   [診斷] ✅ AAPL OK：{len(_test_df)} 筆，"
+                f"price=${last_p:.2f}，avgVol={avg_v:,.0f}，"
+                f"row={'OK' if test_row else 'None（_build_scan_row 失敗）'}"
+            )
+    except Exception as ex:
+        progress_cb(f"   [診斷] ❌ AAPL 例外：{ex}")
+
+    # ── 失敗類型計數（輔助診斷） ─────────────────────────────
+    _cnt: dict[str, int] = {
+        "api_none": 0, "too_short": 0,
+        "low_price": 0, "low_vol": 0,
+        "build_fail": 0, "exception": 0,
+    }
+
     def _process(sym: str) -> Optional[dict]:
-        df = _tiingo_fetch_one(sym, start_date, api_key)
-        if df is None or len(df) < 50:
-            return None
-        last_price = float(df["adj_close"].iloc[-1])
-        avg_vol    = float(df["volume"].tail(20).mean())
-        if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOLUME:
-            return None
-        return _build_scan_row(sym, df)   # df 在這裡計算完就可被 GC
+        """回傳 (tag, row_or_None)；tag 供診斷計數用"""
+        try:
+            df = _tiingo_fetch_one(sym, start_date, api_key)
+            if df is None:
+                return ("api_none", None)
+            if len(df) < 50:
+                return ("too_short", None)
+            last_price = float(df["adj_close"].iloc[-1])
+            avg_vol    = float(df["volume"].tail(20).mean())
+            if last_price < MIN_PRICE:
+                return ("low_price", None)
+            if avg_vol < MIN_AVG_VOLUME:
+                return ("low_vol", None)
+            row = _build_scan_row(sym, df)
+            if row is None:
+                return ("build_fail", None)
+            return ("ok", row)
+        except Exception as e:
+            logger.debug(f"{sym} _process 例外：{e}")
+            return ("exception", None)
 
     with ThreadPoolExecutor(max_workers=_TIINGO_WORKERS) as ex:
         futures = {ex.submit(_process, s): s for s in symbols}
         done = 0
         for fut in as_completed(futures):
             try:
-                row = fut.result()
-                if row is not None:
+                tag, row = fut.result()
+                if tag == "ok":
                     rows.append(row)
-            except Exception:
-                pass
+                else:
+                    _cnt[tag] = _cnt.get(tag, 0) + 1
+            except Exception as e:
+                logger.debug(f"future exception: {e}")
+                _cnt["exception"] += 1
             done += 1
             if done % 500 == 0 or done >= total:
-                progress_cb(f"   Tiingo 進度：{done}/{total} 支（有效：{len(rows)} 支）")
+                progress_cb(
+                    f"   Tiingo 進度：{done}/{total} 支"
+                    f"（有效：{len(rows)}｜"
+                    f"API無資料：{_cnt['api_none']}｜"
+                    f"資料不足：{_cnt['too_short']}｜"
+                    f"低量：{_cnt['low_vol']}｜"
+                    f"低價：{_cnt['low_price']}）"
+                )
 
+    # 最終統計
+    progress_cb(
+        f"   [診斷] 失敗分類 — "
+        f"API無資料:{_cnt['api_none']} "
+        f"資料不足:{_cnt['too_short']} "
+        f"低量:{_cnt['low_vol']} "
+        f"低價:{_cnt['low_price']} "
+        f"build失敗:{_cnt['build_fail']} "
+        f"例外:{_cnt['exception']}"
+    )
     return rows
 
 
