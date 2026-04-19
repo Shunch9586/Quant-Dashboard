@@ -763,7 +763,7 @@ def _enrich_industry(
     if US_IND_CACHE.exists():
         try:
             cached = pd.read_parquet(str(US_IND_CACHE))
-            for _, r in cached.iterrows():
+            for r in cached.to_dict("records"):  # to_dict 比 iterrows 快 10x+
                 cache_map[str(r["symbol"])] = {
                     "name":     str(r.get("name", "") or ""),
                     "industry": str(r.get("industry", "") or ""),

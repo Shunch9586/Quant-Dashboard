@@ -193,14 +193,18 @@ def _try_paths(fs, paths: list[str], market_tag: Optional[str]) -> Optional[pd.D
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     """確保欄位存在且型別正確"""
+    _DEFAULT: dict = {"bool": False, "str": "", "float64": 0.0}
+
     for col, dtype in _DTYPE_MAP.items():
         if col not in df.columns:
-            df[col] = False if dtype == "bool" else ("" if dtype == "str" else 0.0)
+            df[col] = _DEFAULT.get(dtype, 0.0)
         else:
             try:
                 df[col] = df[col].astype(dtype)
-            except Exception:
-                pass
+            except Exception as e:
+                # 轉換失敗時用預設值填滿，不讓錯誤型別流入 UI
+                logger.warning(f"_normalize: 欄位 {col!r} 轉型 {dtype} 失敗，以預設值填充（{e}）")
+                df[col] = _DEFAULT.get(dtype, 0.0)
 
     # 空白 / NaN 產業別 → 「未分類」
     if "industry" in df.columns:
@@ -212,9 +216,9 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
         mask = df["name"].fillna("").str.strip() == ""
         df.loc[mask, "name"] = df.loc[mask, "symbol"]
 
-    # market 大寫統一
+    # market 大寫統一（fillna 確保 NaN 不殘留）
     if "market" in df.columns:
-        df["market"] = df["market"].str.upper().str.strip()
+        df["market"] = df["market"].fillna("").str.upper().str.strip()
 
     return df
 

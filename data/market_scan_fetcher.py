@@ -219,7 +219,7 @@ def _compute_tw_scan(price_df: pd.DataFrame, info_df: pd.DataFrame) -> pd.DataFr
     # stock_id → info lookup
     info_map: dict[str, dict] = {}
     if not info_df.empty:
-        for _, r in info_df.iterrows():
+        for r in info_df.to_dict("records"):  # to_dict 比 iterrows 快 10x+
             sid = str(r["stock_id"])
             industry = str(r.get("industry_category") or "未分類").strip() or "未分類"
             info_map[sid] = {
